@@ -1,0 +1,463 @@
+//! The public `Miner`. Token-count sharding with a `RwLock` per shard; cluster
+//! bodies in a shared `DashMap` keyed by id.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
+
+use crate::cluster::{Cluster, ClusterInner};
+use crate::options::Options;
+use crate::similarity::similarity;
+use crate::snapshot::{decode, encode, ClusterSnapshot, SnapshotV1, TokenSnapshot};
+use crate::tokenize::{is_numeric_token, tokenize, Token};
+use crate::{ClusterId, OwnedToken};
+
+/// How an `add` affected the matched/created cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateType {
+    /// A brand-new cluster was created.
+    Created,
+    /// An existing cluster's template was generalized.
+    TemplateChanged,
+    /// An existing cluster matched with no template change.
+    None,
+}
+
+/// Result of [`Miner::add`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddResult {
+    /// The cluster the line was assigned to.
+    pub cluster_id: ClusterId,
+    /// What happened to that cluster.
+    pub update: UpdateType,
+}
+
+/// One shard: the prefix tree for a single token count, behind its own lock.
+struct Shard {
+    root: crate::tree::TreeNode,
+}
+
+/// Thread-safe online log-template miner.
+pub struct Miner {
+    shards: DashMap<usize, Arc<RwLock<Shard>>, FxBuildHasher>,
+    clusters_by_id: DashMap<ClusterId, Arc<RwLock<ClusterInner>>, FxBuildHasher>,
+    options: Arc<Options>,
+    counter: AtomicU64,
+}
+
+impl Miner {
+    /// Build a miner from resolved options.
+    pub fn from_options(options: Options) -> Self {
+        Miner {
+            shards: DashMap::with_hasher(FxBuildHasher),
+            clusters_by_id: DashMap::with_hasher(FxBuildHasher),
+            options: Arc::new(options),
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Start building a miner with the default builder.
+    pub fn builder() -> crate::MinerBuilder {
+        crate::MinerBuilder::new()
+    }
+
+    /// Number of live clusters.
+    pub fn len(&self) -> usize {
+        self.clusters_by_id.len()
+    }
+
+    /// Whether the miner has no clusters.
+    pub fn is_empty(&self) -> bool {
+        self.clusters_by_id.is_empty()
+    }
+
+    /// Compute the descent keys for a token vector (numeric -> wildcard).
+    fn descent_keys(&self, tokens: &[Token<'_>]) -> SmallVec<[Arc<str>; 8]> {
+        let n = self.options.prefix_len().min(tokens.len());
+        let mut keys: SmallVec<[Arc<str>; 8]> = SmallVec::new();
+        for tok in &tokens[..n] {
+            if self.options.parametrize_numeric_tokens && is_numeric_token(tok.text) {
+                keys.push(self.options.wildcard.clone());
+            } else {
+                keys.push(Arc::from(tok.text));
+            }
+        }
+        keys
+    }
+
+    /// Get the shard for `count`, creating it if absent.
+    fn shard_for(&self, count: usize) -> Arc<RwLock<Shard>> {
+        if let Some(s) = self.shards.get(&count) {
+            return s.clone();
+        }
+        self.shards
+            .entry(count)
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(Shard {
+                    root: crate::tree::TreeNode::new_internal(),
+                }))
+            })
+            .clone()
+    }
+
+    /// Ingest a line. Returns the assigned cluster id and what happened.
+    pub fn add(&self, line: &str) -> AddResult {
+        let tokens = tokenize(line);
+        let count = tokens.len();
+        let keys = self.descent_keys(&tokens);
+        let shard = self.shard_for(count);
+        let mut guard = shard.write().expect("shard lock poisoned");
+        let leaf = guard
+            .root
+            .descend_or_create(&keys, self.options.max_clusters_per_leaf);
+
+        // Find the best-matching candidate in this leaf.
+        let mut best: Option<(ClusterId, f64)> = None;
+        for id in leaf.ids() {
+            if let Some(c) = self.clusters_by_id.get(&id) {
+                let body = c.read().expect("cluster lock poisoned");
+                let sim = similarity(&body.tokens, &tokens, &self.options.wildcard);
+                if best.map_or(true, |(_, b)| sim > b) {
+                    best = Some((id, sim));
+                }
+            }
+        }
+
+        if let Some((id, sim)) = best {
+            if sim >= self.options.sim_threshold {
+                leaf.touch(id);
+                let arc = self
+                    .clusters_by_id
+                    .get(&id)
+                    .expect("matched id present")
+                    .clone();
+                let mut body = arc.write().expect("cluster lock poisoned");
+                let changed = body.generalize(&tokens, &self.options.wildcard);
+                body.size += 1;
+                body.updated_at = SystemTime::now();
+                let update = if changed {
+                    UpdateType::TemplateChanged
+                } else {
+                    UpdateType::None
+                };
+                return AddResult {
+                    cluster_id: id,
+                    update,
+                };
+            }
+        }
+
+        // No match above threshold -> create a new cluster.
+        let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let owned: Vec<OwnedToken> = tokens.iter().map(OwnedToken::from).collect();
+        let inner = ClusterInner::new(id, owned, SystemTime::now());
+        self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
+        if let Some(evicted) = leaf.insert(id) {
+            self.clusters_by_id.remove(&evicted);
+        }
+        AddResult {
+            cluster_id: id,
+            update: UpdateType::Created,
+        }
+    }
+
+    /// Read-only: return the id of the best cluster at/above threshold, else None.
+    /// Does not learn, does not touch LRU recency.
+    pub fn match_only(&self, line: &str) -> Option<ClusterId> {
+        let tokens = tokenize(line);
+        let count = tokens.len();
+        let keys = self.descent_keys(&tokens);
+        let shard = self.shards.get(&count)?.clone();
+        let guard = shard.read().expect("shard lock poisoned");
+        let leaf = guard.root.descend(&keys)?;
+        let mut best: Option<(ClusterId, f64)> = None;
+        for id in leaf.ids() {
+            if let Some(c) = self.clusters_by_id.get(&id) {
+                let body = c.read().expect("cluster lock poisoned");
+                let sim = similarity(&body.tokens, &tokens, &self.options.wildcard);
+                if best.map_or(true, |(_, b)| sim > b) {
+                    best = Some((id, sim));
+                }
+            }
+        }
+        best.filter(|(_, sim)| *sim >= self.options.sim_threshold)
+            .map(|(id, _)| id)
+    }
+
+    /// Match a line and, on a hit, return the captured wildcard-position values
+    /// (the incoming token at each position where the template token is wildcard).
+    pub fn extract(&self, line: &str) -> Option<(ClusterId, Vec<String>)> {
+        let id = self.match_only(line)?;
+        let tokens = tokenize(line);
+        let arc = self.clusters_by_id.get(&id)?.clone();
+        let body = arc.read().expect("cluster lock poisoned");
+        let mut params = Vec::new();
+        for (stored, tok) in body.tokens.iter().zip(tokens.iter()) {
+            // Arc<str> PartialEq compares contents; clean and clippy-safe.
+            if stored.text == self.options.wildcard {
+                params.push(tok.text.to_string());
+            }
+        }
+        Some((id, params))
+    }
+
+    /// Snapshot of all clusters (order unspecified).
+    pub fn clusters(&self) -> Vec<Cluster> {
+        self.clusters_by_id
+            .iter()
+            .map(|e| {
+                e.value()
+                    .read()
+                    .expect("cluster lock poisoned")
+                    .to_public(&self.options.wildcard)
+            })
+            .collect()
+    }
+
+    /// Snapshot of a single cluster by id.
+    pub fn cluster(&self, id: ClusterId) -> Option<Cluster> {
+        let arc = self.clusters_by_id.get(&id)?.clone();
+        let body = arc.read().expect("cluster lock poisoned");
+        Some(body.to_public(&self.options.wildcard))
+    }
+
+    /// Insert an already-constructed cluster body into the tree + id map.
+    /// Used by `restore`. Assumes `id` is not already present.
+    fn insert_existing(&self, inner: ClusterInner) {
+        let count = inner.tokens.len();
+        // Build a borrowed token view for descent-key computation, scoped so its
+        // borrow of `inner.tokens` ends before `inner` is moved below. `keys` is
+        // owned (Arc<str>), so it outlives the view.
+        let keys = {
+            let view: SmallVec<[Token<'_>; 16]> = inner
+                .tokens
+                .iter()
+                .map(|t| Token {
+                    text: &t.text,
+                    leading_delim: t.leading_delim,
+                    trailing_delim: t.trailing_delim,
+                })
+                .collect();
+            self.descent_keys(&view)
+        };
+        let id = inner.id;
+        let shard = self.shard_for(count);
+        let mut guard = shard.write().expect("shard lock poisoned");
+        let leaf = guard
+            .root
+            .descend_or_create(&keys, self.options.max_clusters_per_leaf);
+        self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
+        if let Some(evicted) = leaf.insert(id) {
+            self.clusters_by_id.remove(&evicted);
+        }
+    }
+
+    /// Serialize miner state (options + counter + flat cluster list) to bytes.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let clusters = self
+            .clusters_by_id
+            .iter()
+            .map(|e| {
+                let b = e.value().read().expect("cluster lock poisoned");
+                ClusterSnapshot {
+                    id: b.id,
+                    tokens: b
+                        .tokens
+                        .iter()
+                        .map(|t| TokenSnapshot {
+                            text: t.text.to_string(),
+                            leading_delim: t.leading_delim,
+                            trailing_delim: t.trailing_delim,
+                        })
+                        .collect(),
+                    size: b.size,
+                    created_at_ms: system_time_to_ms(b.created_at),
+                    updated_at_ms: system_time_to_ms(b.updated_at),
+                }
+            })
+            .collect();
+        let body = SnapshotV1 {
+            options: (*self.options).clone(),
+            counter: self.counter.load(Ordering::Relaxed),
+            clusters,
+        };
+        encode(&body)
+    }
+
+    /// Replace miner state from a snapshot. Clears existing clusters first.
+    ///
+    /// `self.options` is intentionally NOT mutated (it is set at construction and
+    /// `add`/descent depend on it). The snapshot carries options for self-description
+    /// and forward-compat; constructing the destination miner with matching options
+    /// is the caller's responsibility.
+    pub fn restore(&self, bytes: &[u8]) -> Result<(), crate::LogdrainError> {
+        let body = decode(bytes)?;
+        self.shards.clear();
+        self.clusters_by_id.clear();
+        self.counter.store(body.counter, Ordering::Relaxed);
+        for cs in body.clusters {
+            let tokens: Vec<OwnedToken> = cs
+                .tokens
+                .into_iter()
+                .map(|t| OwnedToken {
+                    text: Arc::from(t.text.as_str()),
+                    leading_delim: t.leading_delim,
+                    trailing_delim: t.trailing_delim,
+                })
+                .collect();
+            let inner = ClusterInner {
+                id: cs.id,
+                tokens,
+                size: cs.size,
+                created_at: ms_to_system_time(cs.created_at_ms),
+                updated_at: ms_to_system_time(cs.updated_at_ms),
+            };
+            self.insert_existing(inner);
+        }
+        Ok(())
+    }
+}
+
+fn system_time_to_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+impl crate::MinerBuilder {
+    /// Validate options and construct a [`Miner`].
+    pub fn build(self) -> Result<Miner, crate::LogdrainError> {
+        Ok(Miner::from_options(self.build_options()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MinerBuilder;
+
+    fn miner() -> Miner {
+        Miner::from_options(MinerBuilder::new().build_options().unwrap())
+    }
+
+    #[test]
+    fn first_line_creates_cluster() {
+        let m = miner();
+        let r = m.add("user 42 logged in");
+        assert_eq!(r.update, UpdateType::Created);
+        assert_eq!(r.cluster_id, 1);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn similar_line_joins_and_generalizes() {
+        let m = miner();
+        let a = m.add("user 42 logged in");
+        let b = m.add("user 99 logged in");
+        assert_eq!(b.cluster_id, a.cluster_id);
+        assert_eq!(b.update, UpdateType::TemplateChanged);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn identical_line_is_update_none() {
+        let m = miner();
+        m.add("a b c d e");
+        let r = m.add("a b c d e");
+        assert_eq!(r.update, UpdateType::None);
+    }
+
+    #[test]
+    fn different_token_count_makes_new_cluster() {
+        let m = miner();
+        let a = m.add("a b c");
+        let b = m.add("a b c d");
+        assert_ne!(a.cluster_id, b.cluster_id);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn dissimilar_same_length_makes_new_cluster() {
+        let m = miner();
+        // Default threshold 0.4, 5 tokens: differing in 4/5 -> sim 0.2 < 0.4.
+        let a = m.add("alpha one two three four");
+        let b = m.add("alpha NINE TEN ELEVEN TWELVE");
+        assert_ne!(a.cluster_id, b.cluster_id);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn numeric_parametrization_groups_by_wildcard_prefix() {
+        // With numeric parametrization, leading numbers in the prefix don't
+        // fragment the tree: these two share a descent path.
+        let m = miner();
+        let a = m.add("100 ms elapsed for request");
+        let b = m.add("200 ms elapsed for request");
+        assert_eq!(a.cluster_id, b.cluster_id);
+    }
+
+    #[test]
+    fn ids_are_monotonic() {
+        let m = miner();
+        let a = m.add("a b c");
+        let b = m.add("x y z");
+        assert_eq!(a.cluster_id, 1);
+        assert_eq!(b.cluster_id, 2);
+    }
+
+    #[test]
+    fn builder_build_constructs_miner() {
+        let m = MinerBuilder::new().sim_threshold(0.5).build().unwrap();
+        assert_eq!(m.len(), 0);
+        assert!(MinerBuilder::new().depth(1).build().is_err());
+    }
+
+    #[test]
+    fn match_only_finds_without_learning() {
+        let m = miner();
+        let a = m.add("user 42 logged in");
+        let before = m.len();
+        let hit = m.match_only("user 7 logged in");
+        assert_eq!(hit, Some(a.cluster_id));
+        assert_eq!(m.len(), before); // no new cluster, size unchanged
+        assert_eq!(m.cluster(a.cluster_id).unwrap().size(), 1);
+    }
+
+    #[test]
+    fn match_only_misses_return_none() {
+        let m = miner();
+        m.add("a b c");
+        assert_eq!(m.match_only("x y z w"), None); // different token count
+        assert_eq!(m.match_only("p q r"), None); // same count, no path
+    }
+
+    #[test]
+    fn extract_returns_wildcard_values() {
+        let m = miner();
+        m.add("user 42 logged in");
+        m.add("user 99 logged in"); // generalizes slot 1 to <*>
+        let (id, params) = m.extract("user 7 logged in").unwrap();
+        assert_eq!(id, m.match_only("user 7 logged in").unwrap());
+        assert_eq!(params, vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn clusters_and_cluster_snapshots() {
+        let m = miner();
+        let a = m.add("a b c");
+        m.add("x y z");
+        let all = m.clusters();
+        assert_eq!(all.len(), 2);
+        let one = m.cluster(a.cluster_id).unwrap();
+        assert_eq!(one.id(), a.cluster_id);
+        assert!(m.cluster(99999).is_none());
+    }
+}

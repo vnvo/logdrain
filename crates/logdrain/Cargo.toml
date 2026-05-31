@@ -1,0 +1,25 @@
+[package]
+name = "logdrain"
+version = "0.1.0"
+description = "Online Drain3 log-template mining with path-preserving tokenization"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+smallvec.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+[[example]]
+name = "basic"
+path = "../../examples/basic.rs"
