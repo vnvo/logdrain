@@ -10,10 +10,11 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
 use crate::cluster::{Cluster, ClusterInner};
+use crate::mask::apply_masks;
 use crate::options::Options;
 use crate::similarity::similarity;
 use crate::snapshot::{decode, encode, ClusterSnapshot, SnapshotV1, TokenSnapshot};
-use crate::tokenize::{is_numeric_token, tokenize, Token};
+use crate::tokenize::{is_numeric_token, split_first_line, tokenize_with, Token};
 use crate::{ClusterId, OwnedToken};
 
 /// How an `add` affected the matched/created cluster.
@@ -106,7 +107,23 @@ impl Miner {
 
     /// Ingest a line. Returns the assigned cluster id and what happened.
     pub fn add(&self, line: &str) -> AddResult {
-        let tokens = tokenize(line);
+        self.add_inner(line, None)
+    }
+
+    /// Ingest a line, recording `member` on the matched/created cluster (deduped).
+    pub fn add_with_member(&self, line: &str, member: &str) -> AddResult {
+        self.add_inner(line, Some(member))
+    }
+
+    /// Shared `add` path: mask -> first-line split -> path tokenize -> match/create.
+    fn add_inner(&self, line: &str, member: Option<&str>) -> AddResult {
+        let masked = apply_masks(line, &self.options.masks);
+        let (first, suffix) = if self.options.first_line_only {
+            split_first_line(&masked)
+        } else {
+            (masked.as_ref(), None)
+        };
+        let tokens = tokenize_with(first, self.options.active_path_delimiters());
         let count = tokens.len();
         let keys = self.descent_keys(&tokens);
         let shard = self.shard_for(count);
@@ -139,6 +156,9 @@ impl Miner {
                 let changed = body.generalize(&tokens, &self.options.wildcard);
                 body.size += 1;
                 body.updated_at = SystemTime::now();
+                if let Some(m) = member {
+                    body.add_member(m);
+                }
                 let update = if changed {
                     UpdateType::TemplateChanged
                 } else {
@@ -154,7 +174,10 @@ impl Miner {
         // No match above threshold -> create a new cluster.
         let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let owned: Vec<OwnedToken> = tokens.iter().map(OwnedToken::from).collect();
-        let inner = ClusterInner::new(id, owned, SystemTime::now());
+        let mut inner = ClusterInner::new(id, owned, SystemTime::now(), suffix.map(Arc::from));
+        if let Some(m) = member {
+            inner.add_member(m);
+        }
         self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
         if let Some(evicted) = leaf.insert(id) {
             self.clusters_by_id.remove(&evicted);
@@ -165,10 +188,23 @@ impl Miner {
         }
     }
 
+    /// Preprocess a line the same way `add` does, without learning: returns the
+    /// first-line token vector (after masking + optional first-line split + path
+    /// splitting). The returned tokens borrow `masked`, so the caller keeps it alive.
+    fn tokens_for_query<'a>(&self, masked: &'a str) -> crate::tokenize::Tokens<'a> {
+        let first = if self.options.first_line_only {
+            split_first_line(masked).0
+        } else {
+            masked
+        };
+        tokenize_with(first, self.options.active_path_delimiters())
+    }
+
     /// Read-only: return the id of the best cluster at/above threshold, else None.
     /// Does not learn, does not touch LRU recency.
     pub fn match_only(&self, line: &str) -> Option<ClusterId> {
-        let tokens = tokenize(line);
+        let masked = apply_masks(line, &self.options.masks);
+        let tokens = self.tokens_for_query(&masked);
         let count = tokens.len();
         let keys = self.descent_keys(&tokens);
         let shard = self.shards.get(&count)?.clone();
@@ -192,7 +228,8 @@ impl Miner {
     /// (the incoming token at each position where the template token is wildcard).
     pub fn extract(&self, line: &str) -> Option<(ClusterId, Vec<String>)> {
         let id = self.match_only(line)?;
-        let tokens = tokenize(line);
+        let masked = apply_masks(line, &self.options.masks);
+        let tokens = self.tokens_for_query(&masked);
         let arc = self.clusters_by_id.get(&id)?.clone();
         let body = arc.read().expect("cluster lock poisoned");
         let mut params = Vec::new();
@@ -277,6 +314,8 @@ impl Miner {
                     size: b.size,
                     created_at_ms: system_time_to_ms(b.created_at),
                     updated_at_ms: system_time_to_ms(b.updated_at),
+                    suffix: b.suffix.as_ref().map(|s| s.to_string()),
+                    members: b.members.iter().map(|m| m.to_string()).collect(),
                 }
             })
             .collect();
@@ -315,6 +354,8 @@ impl Miner {
                 size: cs.size,
                 created_at: ms_to_system_time(cs.created_at_ms),
                 updated_at: ms_to_system_time(cs.updated_at_ms),
+                suffix: cs.suffix.map(Arc::from),
+                members: cs.members.into_iter().map(Arc::from).collect(),
             };
             self.insert_existing(inner);
         }
@@ -459,5 +500,74 @@ mod tests {
         let one = m.cluster(a.cluster_id).unwrap();
         assert_eq!(one.id(), a.cluster_id);
         assert!(m.cluster(99999).is_none());
+    }
+
+    fn miner_with(b: MinerBuilder) -> Miner {
+        Miner::from_options(b.build_options().unwrap())
+    }
+
+    #[test]
+    fn path_clustering_preserves_structure() {
+        let m = miner_with(MinerBuilder::new().path_delimiters(&['/']));
+        let a = m.add("PUT /servers/409/foo/10.0.0.1");
+        let b = m.add("PUT /servers/410/foo/10.0.0.2");
+        assert_eq!(a.cluster_id, b.cluster_id);
+        assert_eq!(
+            m.cluster(a.cluster_id).unwrap().template(),
+            "PUT /servers/<*>/foo/<*>"
+        );
+    }
+
+    #[test]
+    fn masks_cluster_high_cardinality_tokens() {
+        let m = miner_with(MinerBuilder::new().masks([crate::builtin_masks::uuid()]));
+        let a = m.add("request 550e8400-e29b-41d4-a716-446655440000 ok");
+        let b = m.add("request 6ba7b810-9dad-11d1-80b4-00c04fd430c8 ok");
+        assert_eq!(a.cluster_id, b.cluster_id);
+        assert_eq!(b.update, UpdateType::None); // identical after masking
+        assert_eq!(
+            m.cluster(a.cluster_id).unwrap().template(),
+            "request <uuid> ok"
+        );
+    }
+
+    #[test]
+    fn first_line_only_captures_suffix() {
+        let m = miner_with(MinerBuilder::new().first_line_only(true));
+        let a = m.add("NullPointerException at Foo\n  at bar()\n  at baz()");
+        assert_eq!(
+            m.cluster(a.cluster_id).unwrap().suffix(),
+            Some("  at bar()\n  at baz()")
+        );
+        // Same first line, different stack -> same cluster; suffix stays the first one.
+        let b = m.add("NullPointerException at Foo\n  at other()");
+        assert_eq!(a.cluster_id, b.cluster_id);
+        assert_eq!(
+            m.cluster(a.cluster_id).unwrap().suffix(),
+            Some("  at bar()\n  at baz()")
+        );
+    }
+
+    #[test]
+    fn add_with_member_records_deduped_members() {
+        let m = miner();
+        let a = m.add_with_member("user 1 logged in", "svc-a");
+        m.add_with_member("user 2 logged in", "svc-b");
+        m.add_with_member("user 3 logged in", "svc-a"); // duplicate member
+        let c = m.cluster(a.cluster_id).unwrap();
+        let members: Vec<&str> = c.members().iter().map(|m| &**m).collect();
+        assert_eq!(members, vec!["svc-a", "svc-b"]);
+        // Plain add records no member.
+        let d = m.add("totally different shape here now");
+        assert!(m.cluster(d.cluster_id).unwrap().members().is_empty());
+    }
+
+    #[test]
+    fn extract_honors_masks_and_path() {
+        let m = miner_with(MinerBuilder::new().path_delimiters(&['/']));
+        m.add("GET /u/409/x");
+        m.add("GET /u/410/x"); // generalize middle to <*>
+        let (_, params) = m.extract("GET /u/777/x").unwrap();
+        assert_eq!(params, vec!["777".to_string()]);
     }
 }

@@ -15,29 +15,63 @@ pub(crate) struct ClusterInner {
     pub(crate) size: u64,
     pub(crate) created_at: SystemTime,
     pub(crate) updated_at: SystemTime,
+    /// Verbatim remainder after the first line (set at creation in first-line mode).
+    pub(crate) suffix: Option<Arc<str>>,
+    /// Deduplicated member labels recorded via `add_with_member`.
+    pub(crate) members: Vec<Arc<str>>,
 }
 
 impl ClusterInner {
-    /// Create a fresh cluster of size 1 from the given owned tokens.
-    pub(crate) fn new(id: ClusterId, tokens: Vec<OwnedToken>, now: SystemTime) -> Self {
+    /// Create a fresh cluster of size 1 from the given owned tokens and optional suffix.
+    pub(crate) fn new(
+        id: ClusterId,
+        tokens: Vec<OwnedToken>,
+        now: SystemTime,
+        suffix: Option<Arc<str>>,
+    ) -> Self {
         ClusterInner {
             id,
             tokens,
             size: 1,
             created_at: now,
             updated_at: now,
+            suffix,
+            members: Vec::new(),
         }
     }
 
-    /// Render the template string by joining token texts with single spaces.
-    /// (v0.1 has no path delimiters, so no special delimiter join yet.)
+    /// Record a member label, de-duplicating against existing members.
+    pub(crate) fn add_member(&mut self, member: &str) {
+        if !self.members.iter().any(|m| &**m == member) {
+            self.members.push(Arc::from(member));
+        }
+    }
+
+    /// Render the template string. Path-joined sub-tokens (where the previous
+    /// token has a trailing delimiter) are joined by that delimiter with no
+    /// space; otherwise tokens are space-separated. A token's own leading
+    /// delimiter is emitted as a prefix only when the previous token did not
+    /// already supply the joining delimiter.
     pub(crate) fn render_template(&self, _wildcard: &str) -> String {
         let mut s = String::new();
+        let mut prev_trailing: Option<char> = None;
         for (i, t) in self.tokens.iter().enumerate() {
             if i > 0 {
-                s.push(' ');
+                match prev_trailing {
+                    Some(c) => s.push(c),
+                    None => s.push(' '),
+                }
+            }
+            if prev_trailing.is_none() {
+                if let Some(c) = t.leading_delim {
+                    s.push(c);
+                }
             }
             s.push_str(&t.text);
+            prev_trailing = t.trailing_delim;
+        }
+        if let Some(c) = prev_trailing {
+            s.push(c);
         }
         s
     }
@@ -54,9 +88,9 @@ impl ClusterInner {
                 continue;
             }
             if &*stored.text != tok.text {
+                // Replace the text but KEEP the delimiter flags so path structure
+                // is preserved (e.g. `/servers/<*>/foo`).
                 stored.text = Arc::from(wildcard);
-                stored.leading_delim = None;
-                stored.trailing_delim = None;
                 changed = true;
             }
         }
@@ -72,6 +106,8 @@ impl ClusterInner {
             size: self.size,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            suffix: self.suffix.clone(),
+            members: self.members.clone(),
         }
     }
 }
@@ -85,6 +121,8 @@ pub struct Cluster {
     size: u64,
     created_at: SystemTime,
     updated_at: SystemTime,
+    suffix: Option<Arc<str>>,
+    members: Vec<Arc<str>>,
 }
 
 impl Cluster {
@@ -104,13 +142,13 @@ impl Cluster {
     pub fn tokens(&self) -> &[OwnedToken] {
         &self.tokens
     }
-    /// Stack-trace suffix — always `None` in v0.1 (lands in v0.2).
+    /// Verbatim suffix captured in first-line-only mode, if any.
     pub fn suffix(&self) -> Option<&str> {
-        None
+        self.suffix.as_deref()
     }
-    /// Deduplicated members — always empty in v0.1 (lands in v0.2).
+    /// Deduplicated member labels recorded via `add_with_member`.
     pub fn members(&self) -> &[Arc<str>] {
-        &[]
+        &self.members
     }
     /// When the cluster was first created.
     pub fn created_at(&self) -> SystemTime {
@@ -130,7 +168,7 @@ mod tests {
 
     fn inner_from(line: &str, id: u64) -> ClusterInner {
         let toks: Vec<_> = tokenize(line).iter().map(crate::OwnedToken::from).collect();
-        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH)
+        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None)
     }
 
     #[test]
@@ -176,5 +214,75 @@ mod tests {
         assert_eq!(snap.tokens().len(), 2);
         assert!(snap.suffix().is_none());
         assert!(snap.members().is_empty());
+    }
+
+    use crate::tokenize::tokenize_with;
+
+    fn inner_path(line: &str, id: u64) -> ClusterInner {
+        let toks: Vec<_> = tokenize_with(line, &['/'])
+            .iter()
+            .map(crate::OwnedToken::from)
+            .collect();
+        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None)
+    }
+
+    #[test]
+    fn suffix_is_exposed() {
+        let toks: Vec<_> = tokenize("boom")
+            .iter()
+            .map(crate::OwnedToken::from)
+            .collect();
+        let c = ClusterInner::new(
+            1,
+            toks,
+            SystemTime::UNIX_EPOCH,
+            Some(Arc::from("at line 1\nat line 2")),
+        );
+        assert_eq!(c.to_public("<*>").suffix(), Some("at line 1\nat line 2"));
+    }
+
+    #[test]
+    fn members_dedup() {
+        let mut c = inner_from("a b", 1);
+        c.add_member("svc-a");
+        c.add_member("svc-b");
+        c.add_member("svc-a"); // duplicate ignored
+        let snap = c.to_public("<*>");
+        let members: Vec<&str> = snap.members().iter().map(|m| &**m).collect();
+        assert_eq!(members, vec!["svc-a", "svc-b"]);
+    }
+
+    #[test]
+    fn render_round_trips_path_template() {
+        let c = inner_path("/servers/409/foo", 1);
+        assert_eq!(c.render_template("<*>"), "/servers/409/foo");
+    }
+
+    #[test]
+    fn render_round_trips_mixed() {
+        let c = inner_path("GET /servers/409 ok", 1);
+        assert_eq!(c.render_template("<*>"), "GET /servers/409 ok");
+    }
+
+    #[test]
+    fn render_round_trips_trailing_delim() {
+        let c = inner_path("dir/", 1);
+        assert_eq!(c.render_template("<*>"), "dir/");
+    }
+
+    #[test]
+    fn generalize_preserves_path_structure() {
+        let mut c = inner_path("/servers/409/foo", 1);
+        let incoming = tokenize_with("/servers/410/foo", &['/']);
+        assert!(c.generalize(&incoming, "<*>"));
+        assert_eq!(c.render_template("<*>"), "/servers/<*>/foo");
+    }
+
+    #[test]
+    fn generalize_path_is_idempotent() {
+        let mut c = inner_path("/servers/409/foo", 1);
+        assert!(c.generalize(&tokenize_with("/servers/410/foo", &['/']), "<*>"));
+        assert!(!c.generalize(&tokenize_with("/servers/999/foo", &['/']), "<*>"));
+        assert_eq!(c.render_template("<*>"), "/servers/<*>/foo");
     }
 }

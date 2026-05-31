@@ -7,11 +7,14 @@ use crate::options::Options;
 
 /// 8-byte file magic.
 pub(crate) const MAGIC: &[u8; 8] = b"LOGDRAIN";
-/// Current snapshot version.
-pub(crate) const VERSION: u32 = 1;
+/// Current snapshot version. Bumped from 1 (v0.1) because the v0.2 layout adds
+/// fields to both `Options` and `ClusterSnapshot`. bincode is not
+/// self-describing, so a positional layout change requires a new version;
+/// `decode` rejects any other version cleanly (no silent misparse).
+pub(crate) const VERSION: u32 = 2;
 
 /// A single serialized cluster. Tokens stored as plain strings to avoid the
-/// serde `rc` feature. Delimiters are reserved for v0.2 (always None now).
+/// serde `rc` feature.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ClusterSnapshot {
     pub id: u64,
@@ -19,6 +22,10 @@ pub(crate) struct ClusterSnapshot {
     pub size: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Verbatim first-line-mode suffix.
+    pub suffix: Option<String>,
+    /// Deduplicated member labels.
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,7 +64,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<SnapshotV1, crate::LogdrainError> {
     let mut v = [0u8; 4];
     v.copy_from_slice(&bytes[MAGIC.len()..MAGIC.len() + 4]);
     let found = u32::from_le_bytes(v);
-    if found > VERSION {
+    // Exact-match only: bincode is positional, so a different version cannot be
+    // decoded into the current structs. A future phase may add per-version legacy
+    // readers here and dispatch on `found`.
+    if found != VERSION {
         return Err(crate::LogdrainError::UnsupportedSnapshotVersion {
             found,
             max: VERSION,
@@ -122,5 +132,49 @@ mod tests {
             err,
             crate::LogdrainError::UnsupportedSnapshotVersion { found: 999, .. }
         ));
+    }
+
+    #[test]
+    fn older_version_is_rejected() {
+        // A v0.1 (version 1) blob cannot be decoded into the v0.2 layout.
+        let mut bytes = crate::snapshot::MAGIC.to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let err = miner().restore(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::LogdrainError::UnsupportedSnapshotVersion { found: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn round_trip_preserves_suffix_and_members() {
+        let m = Miner::from_options(
+            MinerBuilder::new()
+                .path_delimiters(&['/'])
+                .first_line_only(true)
+                .build_options()
+                .unwrap(),
+        );
+        m.add_with_member("GET /servers/409/foo\ntrace line a\ntrace line b", "svc-a");
+        m.add_with_member("GET /servers/410/foo\ntrace line c", "svc-b");
+
+        let bytes = m.snapshot();
+        let m2 = Miner::from_options(
+            MinerBuilder::new()
+                .path_delimiters(&['/'])
+                .first_line_only(true)
+                .build_options()
+                .unwrap(),
+        );
+        m2.restore(&bytes).unwrap();
+
+        assert_eq!(m2.len(), 1);
+        let id = m2.match_only("GET /servers/999/foo").unwrap();
+        let c = m2.cluster(id).unwrap();
+        assert_eq!(c.template(), "GET /servers/<*>/foo");
+        // Suffix captured at creation (from the first line) survives.
+        assert_eq!(c.suffix(), Some("trace line a\ntrace line b"));
+        let members: Vec<&str> = c.members().iter().map(|m| &**m).collect();
+        assert_eq!(members, vec!["svc-a", "svc-b"]);
     }
 }
