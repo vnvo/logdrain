@@ -1,6 +1,7 @@
-//! Stack-trace clustering: cluster on the first line (path-aware), keep the rest
-//! of each trace verbatim as a suffix. Run with:
-//! `cargo run -p logdrain --example stacktrace`
+//! Cluster multi-line stack traces by their first line (path-aware), keeping the
+//! full trace of the first occurrence as a verbatim suffix. This is how you turn
+//! a flood of near-identical exceptions into a ranked list of distinct failures.
+//! Run with: `cargo run -p logdrain --example stacktrace`
 
 use logdrain::Miner;
 
@@ -11,32 +12,37 @@ fn main() {
         .build()
         .unwrap();
 
+    // Six traces, three distinct failures. The frames differ line-to-line, but
+    // clustering keys on the first line so each failure mode collapses to one.
     let traces = [
-        "NullPointerException in /app/svc/Handler.java\n  at Handler.process(Handler.java:42)\n  at Server.run(Server.java:88)",
-        "NullPointerException in /app/svc/Handler.java\n  at Handler.process(Handler.java:51)",
-        "TimeoutException in /app/svc/Client.java\n  at Client.call(Client.java:12)",
+        "ERROR NullPointerException at com/acme/svc/OrderHandler.process\n\tat OrderHandler.process(OrderHandler.java:142)\n\tat Dispatcher.run(Dispatcher.java:88)\n\tat java.base/Thread.run(Thread.java:829)",
+        "ERROR NullPointerException at com/acme/svc/OrderHandler.process\n\tat OrderHandler.process(OrderHandler.java:155)\n\tat Dispatcher.run(Dispatcher.java:88)",
+        "ERROR NullPointerException at com/acme/svc/OrderHandler.process\n\tat OrderHandler.process(OrderHandler.java:142)\n\tat Retry.attempt(Retry.java:20)",
+        "ERROR SQLTimeoutException at com/acme/db/ConnectionPool.acquire\n\tat ConnectionPool.acquire(ConnectionPool.java:64)\n\tat OrderHandler.load(OrderHandler.java:71)",
+        "ERROR SQLTimeoutException at com/acme/db/ConnectionPool.acquire\n\tat ConnectionPool.acquire(ConnectionPool.java:64)\n\tat Report.build(Report.java:31)",
+        "WARN RetryableException at com/acme/net/HttpClient.call\n\tat HttpClient.call(HttpClient.java:33)",
     ];
 
     for t in traces {
-        let r = miner.add(t);
-        println!(
-            "#{} ({:?}) <- {}",
-            r.cluster_id,
-            r.update,
-            t.lines().next().unwrap()
-        );
+        miner.add(t);
     }
 
-    println!("\n{} clusters:", miner.len());
     let mut clusters = miner.clusters();
-    clusters.sort_by_key(|c| c.id());
-    for c in clusters {
-        println!("  #{} (size {}): {}", c.id(), c.size(), c.template());
+    clusters.sort_by(|a, b| b.size().cmp(&a.size()).then(a.id().cmp(&b.id())));
+
+    println!(
+        "{} traces  ->  {} distinct failures\n",
+        clusters.iter().map(|c| c.size()).sum::<u64>(),
+        clusters.len(),
+    );
+
+    for c in &clusters {
+        println!("#{}  x{}  {}", c.id(), c.size(), c.template());
         if let Some(suffix) = c.suffix() {
-            println!("      suffix (from first occurrence):");
-            for line in suffix.lines() {
-                println!("        {line}");
+            for frame in suffix.lines() {
+                println!("        {}", frame.trim_start());
             }
         }
+        println!();
     }
 }
