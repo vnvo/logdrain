@@ -48,3 +48,62 @@ proptest! {
         }
     }
 }
+
+fn path_miner() -> Miner {
+    Miner::from_options(
+        MinerBuilder::new()
+            .path_delimiters(&['/'])
+            .build_options()
+            .unwrap(),
+    )
+}
+
+fn first_line_miner() -> Miner {
+    Miner::from_options(
+        MinerBuilder::new()
+            .first_line_only(true)
+            .build_options()
+            .unwrap(),
+    )
+}
+
+proptest! {
+    // With path delimiters, add-then-match is consistent for a path line.
+    #[test]
+    fn path_add_then_match(segs in prop::collection::vec("[a-z]{1,5}", 1..6)) {
+        let line = format!("/{}", segs.join("/"));
+        let m = path_miner();
+        let a = m.add(&line);
+        prop_assert_eq!(m.match_only(&line), Some(a.cluster_id));
+    }
+
+    // The rendered path template re-tokenizes to the same number of tokens
+    // (delimiter-aware rendering is structurally faithful).
+    #[test]
+    fn path_template_token_count_stable(segs in prop::collection::vec("[a-z]{1,5}", 1..6)) {
+        let line = format!("/{}", segs.join("/"));
+        let m = path_miner();
+        let a = m.add(&line);
+        let template = m.cluster(a.cluster_id).unwrap().template().to_string();
+        // Re-feeding the rendered template lands in the same cluster.
+        prop_assert_eq!(m.match_only(&template), Some(a.cluster_id));
+    }
+
+    // In first-line-only mode, the suffix captured at creation is stable when the
+    // same first line is re-added with a different suffix.
+    #[test]
+    fn suffix_is_stable(
+        first in "[a-z][a-z ]{0,18}",
+        suffix in "[a-zA-Z0-9 \n]{0,20}",
+    ) {
+        let m = first_line_miner();
+        let a = m.add(&format!("{first}\n{suffix}"));
+        let captured = m.cluster(a.cluster_id).unwrap().suffix().map(|s| s.to_string());
+        let b = m.add(&format!("{first}\nDIFFERENT SUFFIX"));
+        prop_assert_eq!(a.cluster_id, b.cluster_id);
+        prop_assert_eq!(
+            m.cluster(a.cluster_id).unwrap().suffix().map(|s| s.to_string()),
+            captured
+        );
+    }
+}

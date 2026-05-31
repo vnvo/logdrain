@@ -24,3 +24,7 @@ proptest = "1"
 [[example]]
 name = "basic"
 path = "../../examples/basic.rs"
+
+[[example]]
+name = "stacktrace"
+path = "../../examples/stacktrace.rs"
