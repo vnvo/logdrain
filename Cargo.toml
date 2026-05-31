@@ -10,6 +10,7 @@ repository = "https://github.com/USER/logdrain"
 authors = ["logdrain authors"]
 
 [workspace.dependencies]
+regex = "1"
 rustc-hash = "2"
 dashmap = "6"
 lru = "0.12"

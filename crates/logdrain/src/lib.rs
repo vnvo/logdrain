@@ -5,6 +5,7 @@
 
 mod cluster;
 mod error;
+mod mask;
 mod miner;
 mod options;
 mod similarity;
@@ -14,6 +15,7 @@ mod tree;
 
 pub use cluster::Cluster;
 pub use error::LogdrainError;
+pub use mask::{builtin_masks, Mask};
 pub use miner::{AddResult, Miner, UpdateType};
 pub use options::{MinerBuilder, Options};
 pub use tokenize::{OwnedToken, Token};

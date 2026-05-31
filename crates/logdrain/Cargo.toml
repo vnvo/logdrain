@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+regex.workspace = true
 rustc-hash.workspace = true
 dashmap.workspace = true
 lru.workspace = true

@@ -9,6 +9,10 @@ pub enum LogdrainError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// A mask regex failed to compile.
+    #[error("regex compile failed: {0}")]
+    RegexCompile(#[from] regex::Error),
+
     /// Snapshot bytes did not start with the expected magic.
     #[error("corrupt snapshot: bad magic")]
     BadMagic,
