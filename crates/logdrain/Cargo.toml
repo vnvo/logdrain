@@ -37,3 +37,7 @@ path = "../../examples/stacktrace.rs"
 [[example]]
 name = "highvolume"
 path = "../../examples/highvolume.rs"
+
+[[example]]
+name = "scaling"
+path = "../../examples/scaling.rs"
