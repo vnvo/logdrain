@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/logdrain"]
+members = ["crates/logdrain", "crates/logdrain-cli"]
 
 [workspace.package]
 edition = "2021"
