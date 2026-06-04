@@ -1,47 +1,49 @@
-//! Prefix tree within a shard + per-leaf LRU bucket.
+//! Prefix tree within a shard + per-leaf cluster bucket.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use lru::LruCache;
 use rustc_hash::FxBuildHasher;
 
 use crate::ClusterId;
 
-/// Leaf bucket: an LRU set of cluster ids. Bodies live in the miner's
-/// `clusters_by_id` map; this only tracks membership + recency.
+/// Leaf bucket: the set of cluster ids at a leaf, with a capacity. Bodies live in
+/// the miner's `clusters_by_id` map and carry their own recency, so the leaf only
+/// tracks membership; the miner performs capacity-bounded LRU eviction.
 #[derive(Debug)]
 pub(crate) struct LeafBucket {
-    clusters: LruCache<ClusterId, ()>,
+    cap: usize,
+    ids: Vec<ClusterId>,
 }
 
 impl LeafBucket {
-    /// New leaf bounded at `cap` clusters (`cap >= 1`).
+    /// New leaf bounded at `cap` clusters.
     pub(crate) fn new(cap: usize) -> Self {
-        let cap = NonZeroUsize::new(cap).expect("cap must be >= 1");
         LeafBucket {
-            clusters: LruCache::new(cap),
+            cap,
+            ids: Vec::new(),
         }
     }
 
-    /// Insert a cluster id as most-recently-used. If insertion evicts the
-    /// least-recently-used id (bucket was full), returns the evicted id.
-    pub(crate) fn insert(&mut self, id: ClusterId) -> Option<ClusterId> {
-        // `push` returns the evicted (key, value) when at capacity.
-        match self.clusters.push(id, ()) {
-            Some((evicted, ())) if evicted != id => Some(evicted),
-            _ => None,
+    /// The cluster ids currently in the bucket.
+    pub(crate) fn ids(&self) -> &[ClusterId] {
+        &self.ids
+    }
+
+    /// Whether the bucket is at capacity (a further insert should evict first).
+    pub(crate) fn is_full(&self) -> bool {
+        self.ids.len() >= self.cap
+    }
+
+    /// Add a cluster id (caller ensures capacity via [`Self::is_full`] + eviction).
+    pub(crate) fn insert(&mut self, id: ClusterId) {
+        self.ids.push(id);
+    }
+
+    /// Remove a cluster id if present.
+    pub(crate) fn remove(&mut self, id: ClusterId) {
+        if let Some(pos) = self.ids.iter().position(|&x| x == id) {
+            self.ids.swap_remove(pos);
         }
-    }
-
-    /// Mark a cluster id most-recently-used.
-    pub(crate) fn touch(&mut self, id: ClusterId) {
-        let _ = self.clusters.get(&id);
-    }
-
-    /// All cluster ids currently in the bucket (order unspecified).
-    pub(crate) fn ids(&self) -> Vec<ClusterId> {
-        self.clusters.iter().map(|(k, _)| *k).collect()
     }
 }
 
@@ -119,38 +121,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leaf_inserts_and_lists() {
-        let mut leaf = LeafBucket::new(3);
-        assert!(leaf.insert(10).is_none());
-        assert!(leaf.insert(20).is_none());
-        let mut ids = leaf.ids();
+    fn leaf_membership_and_capacity() {
+        let mut leaf = LeafBucket::new(2);
+        assert!(!leaf.is_full());
+        leaf.insert(10);
+        leaf.insert(20);
+        assert!(leaf.is_full());
+        let mut ids = leaf.ids().to_vec();
         ids.sort_unstable();
         assert_eq!(ids, vec![10, 20]);
-    }
-
-    #[test]
-    fn leaf_evicts_lru_when_full() {
-        let mut leaf = LeafBucket::new(2);
-        assert_eq!(leaf.insert(1), None);
-        assert_eq!(leaf.insert(2), None);
-        // touch 1 so 2 is now least-recently-used
-        leaf.touch(1);
-        let evicted = leaf.insert(3);
-        assert_eq!(evicted, Some(2));
-        let mut ids = leaf.ids();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![1, 3]);
+        leaf.remove(10);
+        assert!(!leaf.is_full());
+        assert_eq!(leaf.ids(), &[20]);
     }
 
     #[test]
     fn descend_creates_path_and_returns_leaf() {
         let mut root = TreeNode::new_internal();
         let keys = [Arc::from("GET"), Arc::from("/api")];
-        let leaf = root.descend_or_create(&keys, 100);
-        assert!(leaf.insert(1).is_none());
+        root.descend_or_create(&keys, 100).insert(1);
         // Descending the same path again reaches the same leaf.
         let leaf2 = root.descend_or_create(&keys, 100);
-        assert_eq!(leaf2.ids(), vec![1]);
+        assert_eq!(leaf2.ids(), &[1]);
     }
 
     #[test]
@@ -167,8 +159,7 @@ mod tests {
     fn empty_keys_make_root_a_leaf() {
         let mut root = TreeNode::new_internal();
         let keys: [Arc<str>; 0] = [];
-        let leaf = root.descend_or_create(&keys, 5);
-        assert!(leaf.insert(1).is_none());
-        assert_eq!(root.descend(&keys).unwrap().ids(), vec![1]);
+        root.descend_or_create(&keys, 5).insert(1);
+        assert_eq!(root.descend(&keys).unwrap().ids(), &[1]);
     }
 }

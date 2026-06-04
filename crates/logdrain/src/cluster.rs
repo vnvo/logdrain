@@ -1,20 +1,42 @@
 //! Cluster types. `ClusterInner` is the mutable body held by the miner;
 //! `Cluster` is an immutable snapshot returned to callers.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::tokenize::Token;
 use crate::{ClusterId, OwnedToken};
 
+/// Unix-millis for a `SystemTime` (saturating to 0 before the epoch).
+pub(crate) fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `SystemTime` from unix-millis.
+pub(crate) fn time_from_ms(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+fn now_ms() -> u64 {
+    unix_ms(SystemTime::now())
+}
+
 /// Mutable cluster body. Stored as `Arc<RwLock<ClusterInner>>` in the miner.
+///
+/// `size` and `updated_at_ms` are atomics so the hot match path can bump a hit
+/// through a shared (read) lock without taking the exclusive cluster lock;
+/// `tokens` and `members` change rarely and stay behind the `RwLock`'s write
+/// guard. `updated_at_ms` doubles as the LRU recency key.
 #[derive(Debug)]
 pub(crate) struct ClusterInner {
     pub(crate) id: ClusterId,
     pub(crate) tokens: Vec<OwnedToken>,
-    pub(crate) size: u64,
+    pub(crate) size: AtomicU64,
     pub(crate) created_at: SystemTime,
-    pub(crate) updated_at: SystemTime,
+    pub(crate) updated_at_ms: AtomicU64,
     /// Verbatim remainder after the first line (set at creation in first-line mode).
     pub(crate) suffix: Option<Arc<str>>,
     /// Deduplicated member labels recorded via `add_with_member`.
@@ -32,12 +54,33 @@ impl ClusterInner {
         ClusterInner {
             id,
             tokens,
-            size: 1,
+            size: AtomicU64::new(1),
             created_at: now,
-            updated_at: now,
+            updated_at_ms: AtomicU64::new(unix_ms(now)),
             suffix,
             members: Vec::new(),
         }
+    }
+
+    /// Record a hit: increment size and refresh recency. Safe through a shared
+    /// reference (atomics), so callers need only the cluster read lock.
+    pub(crate) fn touch(&self) {
+        self.size.fetch_add(1, Ordering::Relaxed);
+        self.updated_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// LRU recency key (last-updated unix-millis).
+    pub(crate) fn recency(&self) -> u64 {
+        self.updated_at_ms.load(Ordering::Relaxed)
+    }
+
+    /// Whether generalizing against `incoming` would change the template. Read-only,
+    /// so the match path can decide if the exclusive lock is needed at all.
+    pub(crate) fn would_generalize(&self, incoming: &[Token<'_>], wildcard: &str) -> bool {
+        self.tokens
+            .iter()
+            .zip(incoming.iter())
+            .any(|(stored, tok)| &*stored.text != wildcard && &*stored.text != tok.text)
     }
 
     /// Record a member label, de-duplicating against existing members.
@@ -103,9 +146,9 @@ impl ClusterInner {
             id: self.id,
             template: self.render_template(wildcard),
             tokens: self.tokens.clone(),
-            size: self.size,
+            size: self.size.load(Ordering::Relaxed),
             created_at: self.created_at,
-            updated_at: self.updated_at,
+            updated_at: time_from_ms(self.updated_at_ms.load(Ordering::Relaxed)),
             suffix: self.suffix.clone(),
             members: self.members.clone(),
         }
@@ -290,16 +333,16 @@ mod tests {
     #[test]
     fn lines_per_minute_zero_on_short_span() {
         // Instant span (created == updated) -> 0.0 (rate unknown), not infinity.
-        let mut c = inner_from("a b", 1);
-        c.size = 5;
+        let c = inner_from("a b", 1);
+        c.size.store(5, Ordering::Relaxed);
         assert_eq!(c.to_public("<*>").lines_per_minute(), 0.0);
     }
 
     #[test]
     fn lines_per_minute_over_two_minutes() {
-        let mut c = inner_from("a b", 1);
-        c.size = 120;
-        c.updated_at = c.created_at + std::time::Duration::from_secs(120);
+        let c = inner_from("a b", 1); // created_at = UNIX_EPOCH
+        c.size.store(120, Ordering::Relaxed);
+        c.updated_at_ms.store(120_000, Ordering::Relaxed); // 120s after the epoch
         assert_eq!(c.to_public("<*>").lines_per_minute(), 60.0); // 120 lines / 2 min
     }
 

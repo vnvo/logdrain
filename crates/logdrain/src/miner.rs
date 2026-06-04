@@ -116,6 +116,10 @@ impl Miner {
     }
 
     /// Shared `add` path: mask -> first-line split -> path tokenize -> match/create.
+    ///
+    /// Matching (the common case) runs under the shard *read* lock, so adds that
+    /// land in the same shard but match existing templates proceed concurrently.
+    /// The shard *write* lock is taken only to create a cluster or grow the tree.
     fn add_inner(&self, line: &str, member: Option<&str>) -> AddResult {
         let masked = apply_masks(line, &self.options.masks);
         let (first, suffix) = if self.options.first_line_only {
@@ -127,51 +131,41 @@ impl Miner {
         let count = tokens.len();
         let keys = self.descent_keys(&tokens);
         let shard = self.shard_for(count);
+
+        // Phase 1 — match under a read lock (no tree mutation, no shard exclusivity).
+        let matched = {
+            let guard = shard.read().expect("shard lock poisoned");
+            guard
+                .root
+                .descend(&keys)
+                .and_then(|leaf| self.best_match(leaf, &tokens))
+                .filter(|&(_, sim)| sim >= self.options.sim_threshold)
+                .map(|(id, _)| id)
+        };
+        if let Some(id) = matched {
+            // The cluster could be evicted between phases; `apply_match` returns
+            // `None` if so, and we fall through to the write phase.
+            if let Some(result) = self.apply_match(id, &tokens, member) {
+                return result;
+            }
+        }
+
+        // Phase 2 — create, under the write lock. Holding it prevents concurrent
+        // eviction of this shard's clusters, so a re-scan match cannot vanish.
         let mut guard = shard.write().expect("shard lock poisoned");
         let leaf = guard
             .root
             .descend_or_create(&keys, self.options.max_clusters_per_leaf);
-
-        // Find the best-matching candidate in this leaf.
-        let mut best: Option<(ClusterId, f64)> = None;
-        for id in leaf.ids() {
-            if let Some(c) = self.clusters_by_id.get(&id) {
-                let body = c.read().expect("cluster lock poisoned");
-                let sim = similarity(&body.tokens, &tokens, &self.options.wildcard);
-                if best.map_or(true, |(_, b)| sim > b) {
-                    best = Some((id, sim));
-                }
-            }
-        }
-
-        if let Some((id, sim)) = best {
+        // Re-scan: another writer may have created a matching cluster meanwhile.
+        if let Some((id, sim)) = self.best_match(leaf, &tokens) {
             if sim >= self.options.sim_threshold {
-                leaf.touch(id);
-                let arc = self
-                    .clusters_by_id
-                    .get(&id)
-                    .expect("matched id present")
-                    .clone();
-                let mut body = arc.write().expect("cluster lock poisoned");
-                let changed = body.generalize(&tokens, &self.options.wildcard);
-                body.size += 1;
-                body.updated_at = SystemTime::now();
-                if let Some(m) = member {
-                    body.add_member(m);
+                if let Some(result) = self.apply_match(id, &tokens, member) {
+                    return result;
                 }
-                let update = if changed {
-                    UpdateType::TemplateChanged
-                } else {
-                    UpdateType::None
-                };
-                return AddResult {
-                    cluster_id: id,
-                    update,
-                };
             }
         }
 
-        // No match above threshold -> create a new cluster.
+        // Genuinely new cluster.
         let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let owned: Vec<OwnedToken> = tokens.iter().map(OwnedToken::from).collect();
         let mut inner = ClusterInner::new(id, owned, SystemTime::now(), suffix.map(Arc::from));
@@ -179,12 +173,85 @@ impl Miner {
             inner.add_member(m);
         }
         self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
-        if let Some(evicted) = leaf.insert(id) {
-            self.clusters_by_id.remove(&evicted);
-        }
+        self.evict_if_full(leaf);
+        leaf.insert(id);
         AddResult {
             cluster_id: id,
             update: UpdateType::Created,
+        }
+    }
+
+    /// Highest-similarity cluster in a leaf and its score, reading bodies under
+    /// their read locks.
+    fn best_match(
+        &self,
+        leaf: &crate::tree::LeafBucket,
+        tokens: &[Token<'_>],
+    ) -> Option<(ClusterId, f64)> {
+        let mut best: Option<(ClusterId, f64)> = None;
+        for &id in leaf.ids() {
+            if let Some(arc) = self.clusters_by_id.get(&id) {
+                let body = arc.read().expect("cluster lock poisoned");
+                let sim = similarity(&body.tokens, tokens, &self.options.wildcard);
+                if best.map_or(true, |(_, b)| sim > b) {
+                    best = Some((id, sim));
+                }
+            }
+        }
+        best
+    }
+
+    /// Apply a match to cluster `id`: bump its hit count + recency under the read
+    /// lock, taking the write lock only to generalize the template or record a
+    /// member. Returns `None` if the cluster was concurrently evicted.
+    fn apply_match(
+        &self,
+        id: ClusterId,
+        tokens: &[Token<'_>],
+        member: Option<&str>,
+    ) -> Option<AddResult> {
+        let arc = self.clusters_by_id.get(&id)?.clone();
+        let needs_generalize = {
+            let body = arc.read().expect("cluster lock poisoned");
+            body.touch();
+            body.would_generalize(tokens, &self.options.wildcard)
+        };
+        if !needs_generalize && member.is_none() {
+            return Some(AddResult {
+                cluster_id: id,
+                update: UpdateType::None,
+            });
+        }
+        let mut body = arc.write().expect("cluster lock poisoned");
+        let changed = needs_generalize && body.generalize(tokens, &self.options.wildcard);
+        if let Some(m) = member {
+            body.add_member(m);
+        }
+        Some(AddResult {
+            cluster_id: id,
+            update: if changed {
+                UpdateType::TemplateChanged
+            } else {
+                UpdateType::None
+            },
+        })
+    }
+
+    /// Evict the least-recently-used cluster from a full leaf to make room. Called
+    /// only under the shard write lock.
+    fn evict_if_full(&self, leaf: &mut crate::tree::LeafBucket) {
+        if !leaf.is_full() {
+            return;
+        }
+        let victim = leaf.ids().iter().copied().min_by_key(|id| {
+            self.clusters_by_id
+                .get(id)
+                .map(|a| a.read().expect("cluster lock poisoned").recency())
+                .unwrap_or(0)
+        });
+        if let Some(v) = victim {
+            leaf.remove(v);
+            self.clusters_by_id.remove(&v);
         }
     }
 
@@ -210,17 +277,8 @@ impl Miner {
         let shard = self.shards.get(&count)?.clone();
         let guard = shard.read().expect("shard lock poisoned");
         let leaf = guard.root.descend(&keys)?;
-        let mut best: Option<(ClusterId, f64)> = None;
-        for id in leaf.ids() {
-            if let Some(c) = self.clusters_by_id.get(&id) {
-                let body = c.read().expect("cluster lock poisoned");
-                let sim = similarity(&body.tokens, &tokens, &self.options.wildcard);
-                if best.map_or(true, |(_, b)| sim > b) {
-                    best = Some((id, sim));
-                }
-            }
-        }
-        best.filter(|(_, sim)| *sim >= self.options.sim_threshold)
+        self.best_match(leaf, &tokens)
+            .filter(|&(_, sim)| sim >= self.options.sim_threshold)
             .map(|(id, _)| id)
     }
 
@@ -288,9 +346,8 @@ impl Miner {
             .root
             .descend_or_create(&keys, self.options.max_clusters_per_leaf);
         self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
-        if let Some(evicted) = leaf.insert(id) {
-            self.clusters_by_id.remove(&evicted);
-        }
+        self.evict_if_full(leaf);
+        leaf.insert(id);
     }
 
     /// Serialize miner state (options + counter + flat cluster list) to bytes.
@@ -311,9 +368,9 @@ impl Miner {
                             trailing_delim: t.trailing_delim,
                         })
                         .collect(),
-                    size: b.size,
+                    size: b.size.load(Ordering::Relaxed),
                     created_at_ms: system_time_to_ms(b.created_at),
-                    updated_at_ms: system_time_to_ms(b.updated_at),
+                    updated_at_ms: b.updated_at_ms.load(Ordering::Relaxed),
                     suffix: b.suffix.as_ref().map(|s| s.to_string()),
                     members: b.members.iter().map(|m| m.to_string()).collect(),
                 }
@@ -351,9 +408,9 @@ impl Miner {
             let inner = ClusterInner {
                 id: cs.id,
                 tokens,
-                size: cs.size,
+                size: AtomicU64::new(cs.size),
                 created_at: ms_to_system_time(cs.created_at_ms),
-                updated_at: ms_to_system_time(cs.updated_at_ms),
+                updated_at_ms: AtomicU64::new(cs.updated_at_ms),
                 suffix: cs.suffix.map(Arc::from),
                 members: cs.members.into_iter().map(Arc::from).collect(),
             };
