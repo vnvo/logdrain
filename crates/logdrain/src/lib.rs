@@ -8,6 +8,7 @@ mod error;
 mod mask;
 mod miner;
 mod options;
+mod persistence;
 mod similarity;
 mod snapshot;
 mod tokenize;
@@ -18,6 +19,7 @@ pub use error::LogdrainError;
 pub use mask::{builtin_masks, Mask};
 pub use miner::{AddResult, Miner, UpdateType};
 pub use options::{MinerBuilder, Options};
+pub use persistence::{FilePersistence, MemoryPersistence, Persistence, PersistenceError};
 pub use tokenize::{OwnedToken, Token};
 
 /// Stable, process-unique identifier for a cluster.

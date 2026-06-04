@@ -361,6 +361,24 @@ impl Miner {
         }
         Ok(())
     }
+
+    /// Serialize the miner and store it via the given backend.
+    pub fn save_state(&self, p: &dyn crate::Persistence) -> Result<(), crate::LogdrainError> {
+        p.save(&self.snapshot())?;
+        Ok(())
+    }
+
+    /// Load state from the backend, replacing current state. Returns `false` if the
+    /// backend held nothing (miner left unchanged), `true` if a snapshot was loaded.
+    pub fn load_state(&self, p: &dyn crate::Persistence) -> Result<bool, crate::LogdrainError> {
+        match p.load()? {
+            Some(bytes) => {
+                self.restore(&bytes)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 fn system_time_to_ms(t: SystemTime) -> u64 {

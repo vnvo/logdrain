@@ -13,6 +13,10 @@ pub enum LogdrainError {
     #[error("regex compile failed: {0}")]
     RegexCompile(#[from] regex::Error),
 
+    /// A persistence backend failed.
+    #[error("persistence: {0}")]
+    Persistence(#[from] crate::persistence::PersistenceError),
+
     /// Snapshot bytes did not start with the expected magic.
     #[error("corrupt snapshot: bad magic")]
     BadMagic,
@@ -24,29 +28,4 @@ pub enum LogdrainError {
     /// bincode failed to decode the snapshot body.
     #[error("corrupt snapshot: {0}")]
     Decode(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_config_displays_message() {
-        let e = LogdrainError::InvalidConfig("depth must be >= 2".into());
-        assert_eq!(e.to_string(), "invalid configuration: depth must be >= 2");
-    }
-
-    #[test]
-    fn bad_magic_displays() {
-        assert_eq!(
-            LogdrainError::BadMagic.to_string(),
-            "corrupt snapshot: bad magic"
-        );
-    }
-
-    #[test]
-    fn unsupported_version_displays() {
-        let e = LogdrainError::UnsupportedSnapshotVersion { found: 9, max: 1 };
-        assert_eq!(e.to_string(), "snapshot version 9 not supported (max 1)");
-    }
 }

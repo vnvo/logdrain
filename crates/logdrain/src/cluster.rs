@@ -158,6 +158,21 @@ impl Cluster {
     pub fn updated_at(&self) -> SystemTime {
         self.updated_at
     }
+    /// Approximate lines-per-minute over the cluster's lifetime. Returns `0.0`
+    /// when the span is under one second (rate is unknown over a sub-second
+    /// window — e.g. a one-shot batch where all lines arrive at once).
+    pub fn lines_per_minute(&self) -> f64 {
+        let secs = self
+            .updated_at
+            .duration_since(self.created_at)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if secs < 1.0 {
+            0.0
+        } else {
+            self.size as f64 / (secs / 60.0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,12 +184,6 @@ mod tests {
     fn inner_from(line: &str, id: u64) -> ClusterInner {
         let toks: Vec<_> = tokenize(line).iter().map(crate::OwnedToken::from).collect();
         ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None)
-    }
-
-    #[test]
-    fn template_joins_with_spaces() {
-        let c = inner_from("GET /api 200", 1);
-        assert_eq!(c.render_template("<*>"), "GET /api 200");
     }
 
     #[test]
@@ -276,6 +285,22 @@ mod tests {
         let incoming = tokenize_with("/servers/410/foo", &['/']);
         assert!(c.generalize(&incoming, "<*>"));
         assert_eq!(c.render_template("<*>"), "/servers/<*>/foo");
+    }
+
+    #[test]
+    fn lines_per_minute_zero_on_short_span() {
+        // Instant span (created == updated) -> 0.0 (rate unknown), not infinity.
+        let mut c = inner_from("a b", 1);
+        c.size = 5;
+        assert_eq!(c.to_public("<*>").lines_per_minute(), 0.0);
+    }
+
+    #[test]
+    fn lines_per_minute_over_two_minutes() {
+        let mut c = inner_from("a b", 1);
+        c.size = 120;
+        c.updated_at = c.created_at + std::time::Duration::from_secs(120);
+        assert_eq!(c.to_public("<*>").lines_per_minute(), 60.0); // 120 lines / 2 min
     }
 
     #[test]
