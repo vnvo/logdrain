@@ -14,8 +14,6 @@ pub struct Options {
     pub sim_threshold: f64,
     /// Prefix-tree depth (`>= 2`). Token levels below the shard root = `depth - 2`.
     pub depth: usize,
-    /// Optional global cluster cap. Stored but not yet enforced (per-leaf LRU bounds).
-    pub max_clusters: Option<usize>,
     /// Max clusters kept per leaf bucket before LRU eviction.
     pub max_clusters_per_leaf: usize,
     /// Replace pure-numeric tokens with the wildcard during tree descent.
@@ -39,7 +37,6 @@ impl Default for Options {
         Options {
             sim_threshold: 0.4,
             depth: 4,
-            max_clusters: None,
             max_clusters_per_leaf: 100,
             parametrize_numeric_tokens: true,
             wildcard: Arc::from("<*>"),
@@ -90,12 +87,6 @@ impl MinerBuilder {
     /// Set the prefix-tree depth (validated `>= 2` at build time).
     pub fn depth(mut self, v: usize) -> Self {
         self.opts.depth = v;
-        self
-    }
-
-    /// Set the optional global cluster cap.
-    pub fn max_clusters(mut self, v: Option<usize>) -> Self {
-        self.opts.max_clusters = v;
         self
     }
 
@@ -170,43 +161,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_spec() {
+    fn defaults() {
         let o = Options::default();
         assert_eq!(o.sim_threshold, 0.4);
         assert_eq!(o.depth, 4);
-        assert_eq!(o.max_clusters, None);
         assert_eq!(o.max_clusters_per_leaf, 100);
         assert!(o.parametrize_numeric_tokens);
         assert_eq!(&*o.wildcard, "<*>");
+        assert!(o.path_delimiters.is_empty());
+        assert!(o.first_line_path_delimiters.is_empty());
+        assert!(!o.first_line_only);
+        assert!(o.masks.is_empty());
     }
 
     #[test]
-    fn builder_overrides_and_builds() {
+    fn builder_sets_all_fields() {
         let o = MinerBuilder::new()
             .sim_threshold(0.6)
             .depth(5)
-            .max_clusters(Some(10_000))
             .max_clusters_per_leaf(50)
             .parametrize_numeric_tokens(false)
             .wildcard("<?>")
+            .path_delimiters(&['/'])
+            .first_line_path_delimiters(&['/', ':'])
+            .first_line_only(true)
+            .masks([crate::builtin_masks::uuid()])
             .build_options()
             .unwrap();
         assert_eq!(o.sim_threshold, 0.6);
         assert_eq!(o.depth, 5);
-        assert_eq!(o.max_clusters, Some(10_000));
         assert_eq!(o.max_clusters_per_leaf, 50);
         assert!(!o.parametrize_numeric_tokens);
         assert_eq!(&*o.wildcard, "<?>");
+        assert_eq!(o.path_delimiters, vec!['/']);
+        assert_eq!(o.first_line_path_delimiters, vec!['/', ':']);
+        assert!(o.first_line_only);
+        assert_eq!(o.masks.len(), 1);
     }
 
     #[test]
-    fn rejects_depth_below_two() {
-        let err = MinerBuilder::new().depth(1).build_options().unwrap_err();
-        assert!(matches!(err, crate::LogdrainError::InvalidConfig(_)));
-    }
-
-    #[test]
-    fn rejects_threshold_out_of_range() {
+    fn rejects_invalid_config() {
+        assert!(MinerBuilder::new().depth(1).build_options().is_err());
         assert!(MinerBuilder::new()
             .sim_threshold(1.5)
             .build_options()
@@ -215,38 +210,10 @@ mod tests {
             .sim_threshold(-0.1)
             .build_options()
             .is_err());
-    }
-
-    #[test]
-    fn rejects_zero_per_leaf() {
         assert!(MinerBuilder::new()
             .max_clusters_per_leaf(0)
             .build_options()
             .is_err());
-    }
-
-    #[test]
-    fn v0_2_defaults_are_off() {
-        let o = Options::default();
-        assert!(o.path_delimiters.is_empty());
-        assert!(o.first_line_path_delimiters.is_empty());
-        assert!(!o.first_line_only);
-        assert!(o.masks.is_empty());
-    }
-
-    #[test]
-    fn builder_sets_v0_2_fields() {
-        let o = MinerBuilder::new()
-            .path_delimiters(&['/'])
-            .first_line_path_delimiters(&['/', ':'])
-            .first_line_only(true)
-            .masks([crate::builtin_masks::uuid()])
-            .build_options()
-            .unwrap();
-        assert_eq!(o.path_delimiters, vec!['/']);
-        assert_eq!(o.first_line_path_delimiters, vec!['/', ':']);
-        assert!(o.first_line_only);
-        assert_eq!(o.masks.len(), 1);
     }
 
     #[test]

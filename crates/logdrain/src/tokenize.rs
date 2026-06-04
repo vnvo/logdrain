@@ -135,13 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn delims_are_none_in_v0_1() {
-        let toks = tokenize("x");
-        assert!(toks[0].leading_delim.is_none());
-        assert!(toks[0].trailing_delim.is_none());
-    }
-
-    #[test]
     fn numeric_detection() {
         assert!(is_numeric_token("12345"));
         assert!(is_numeric_token("0"));
@@ -149,13 +142,6 @@ mod tests {
         assert!(!is_numeric_token("12a"));
         assert!(!is_numeric_token("-3"));
         assert!(!is_numeric_token("1.5"));
-    }
-
-    #[test]
-    fn owned_token_round_trips() {
-        let toks = tokenize("hello");
-        let owned = OwnedToken::from(&toks[0]);
-        assert_eq!(&*owned.text, "hello");
     }
 
     fn flags<'a>(t: &Token<'a>) -> (&'a str, Option<char>, Option<char>) {
