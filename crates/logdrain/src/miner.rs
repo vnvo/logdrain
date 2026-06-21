@@ -48,6 +48,8 @@ pub struct Miner {
     clusters_by_id: DashMap<ClusterId, Arc<RwLock<ClusterInner>>, FxBuildHasher>,
     options: Arc<Options>,
     counter: AtomicU64,
+    /// Monotonic clock for LRU recency (incremented on every hit/create).
+    tick: AtomicU64,
 }
 
 impl Miner {
@@ -58,7 +60,13 @@ impl Miner {
             clusters_by_id: DashMap::with_hasher(FxBuildHasher),
             options: Arc::new(options),
             counter: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
         }
+    }
+
+    /// Next monotonic recency tick.
+    fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Start building a miner with the default builder.
@@ -76,15 +84,17 @@ impl Miner {
         self.clusters_by_id.is_empty()
     }
 
-    /// Compute the descent keys for a token vector (numeric -> wildcard).
-    fn descent_keys(&self, tokens: &[Token<'_>]) -> SmallVec<[Arc<str>; 8]> {
+    /// Compute the descent keys for a token vector (numeric -> wildcard). Keys are
+    /// borrowed `&str` (from the line or the wildcard), so the match path does no
+    /// allocation; owned keys are minted only when a new tree branch is created.
+    fn descent_keys<'a>(&'a self, tokens: &'a [Token<'a>]) -> SmallVec<[&'a str; 8]> {
         let n = self.options.prefix_len().min(tokens.len());
-        let mut keys: SmallVec<[Arc<str>; 8]> = SmallVec::new();
+        let mut keys: SmallVec<[&'a str; 8]> = SmallVec::new();
         for tok in &tokens[..n] {
             if self.options.parametrize_numeric_tokens && is_numeric_token(tok.text) {
-                keys.push(self.options.wildcard.clone());
+                keys.push(&self.options.wildcard);
             } else {
-                keys.push(Arc::from(tok.text));
+                keys.push(tok.text);
             }
         }
         keys
@@ -139,15 +149,10 @@ impl Miner {
                 .root
                 .descend(&keys)
                 .and_then(|leaf| self.best_match(leaf, &tokens))
-                .filter(|&(_, sim)| sim >= self.options.sim_threshold)
-                .map(|(id, _)| id)
+                .filter(|(_, sim, _)| *sim >= self.options.sim_threshold)
         };
-        if let Some(id) = matched {
-            // The cluster could be evicted between phases; `apply_match` returns
-            // `None` if so, and we fall through to the write phase.
-            if let Some(result) = self.apply_match(id, &tokens, member) {
-                return result;
-            }
+        if let Some((id, _, arc)) = matched {
+            return self.apply_match(&arc, id, &tokens, member);
         }
 
         // Phase 2 — create, under the write lock. Holding it prevents concurrent
@@ -157,11 +162,10 @@ impl Miner {
             .root
             .descend_or_create(&keys, self.options.max_clusters_per_leaf);
         // Re-scan: another writer may have created a matching cluster meanwhile.
-        if let Some((id, sim)) = self.best_match(leaf, &tokens) {
+        if let Some((id, sim, arc)) = self.best_match(leaf, &tokens) {
             if sim >= self.options.sim_threshold {
-                if let Some(result) = self.apply_match(id, &tokens, member) {
-                    return result;
-                }
+                drop(guard);
+                return self.apply_match(&arc, id, &tokens, member);
             }
         }
 
@@ -169,6 +173,7 @@ impl Miner {
         let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let owned: Vec<OwnedToken> = tokens.iter().map(OwnedToken::from).collect();
         let mut inner = ClusterInner::new(id, owned, SystemTime::now(), suffix.map(Arc::from));
+        inner.last_used.store(self.next_tick(), Ordering::Relaxed); // mark freshly used
         if let Some(m) = member {
             inner.add_member(m);
         }
@@ -181,60 +186,63 @@ impl Miner {
         }
     }
 
-    /// Highest-similarity cluster in a leaf and its score, reading bodies under
-    /// their read locks.
+    /// Highest-similarity cluster in a leaf: its id, score, and a handle to its
+    /// body (so the caller need not look it up again). Reads bodies under their
+    /// read locks.
     fn best_match(
         &self,
         leaf: &crate::tree::LeafBucket,
         tokens: &[Token<'_>],
-    ) -> Option<(ClusterId, f64)> {
-        let mut best: Option<(ClusterId, f64)> = None;
+    ) -> Option<(ClusterId, f64, Arc<RwLock<ClusterInner>>)> {
+        let mut best: Option<(ClusterId, f64, Arc<RwLock<ClusterInner>>)> = None;
         for &id in leaf.ids() {
-            if let Some(arc) = self.clusters_by_id.get(&id) {
-                let body = arc.read().expect("cluster lock poisoned");
-                let sim = similarity(&body.tokens, tokens, &self.options.wildcard);
-                if best.map_or(true, |(_, b)| sim > b) {
-                    best = Some((id, sim));
+            if let Some(entry) = self.clusters_by_id.get(&id) {
+                let sim = {
+                    let body = entry.read().expect("cluster lock poisoned");
+                    similarity(&body.tokens, tokens, &self.options.wildcard)
+                };
+                if best.as_ref().map_or(true, |(_, b, _)| sim > *b) {
+                    best = Some((id, sim, entry.value().clone()));
                 }
             }
         }
         best
     }
 
-    /// Apply a match to cluster `id`: bump its hit count + recency under the read
+    /// Apply a match to a cluster: bump its hit count + recency under the read
     /// lock, taking the write lock only to generalize the template or record a
-    /// member. Returns `None` if the cluster was concurrently evicted.
+    /// member.
     fn apply_match(
         &self,
+        arc: &Arc<RwLock<ClusterInner>>,
         id: ClusterId,
         tokens: &[Token<'_>],
         member: Option<&str>,
-    ) -> Option<AddResult> {
-        let arc = self.clusters_by_id.get(&id)?.clone();
+    ) -> AddResult {
         let needs_generalize = {
             let body = arc.read().expect("cluster lock poisoned");
-            body.touch();
+            body.touch(self.next_tick());
             body.would_generalize(tokens, &self.options.wildcard)
         };
         if !needs_generalize && member.is_none() {
-            return Some(AddResult {
+            return AddResult {
                 cluster_id: id,
                 update: UpdateType::None,
-            });
+            };
         }
         let mut body = arc.write().expect("cluster lock poisoned");
         let changed = needs_generalize && body.generalize(tokens, &self.options.wildcard);
         if let Some(m) = member {
             body.add_member(m);
         }
-        Some(AddResult {
+        AddResult {
             cluster_id: id,
             update: if changed {
                 UpdateType::TemplateChanged
             } else {
                 UpdateType::None
             },
-        })
+        }
     }
 
     /// Evict the least-recently-used cluster from a full leaf to make room. Called
@@ -278,8 +286,8 @@ impl Miner {
         let guard = shard.read().expect("shard lock poisoned");
         let leaf = guard.root.descend(&keys)?;
         self.best_match(leaf, &tokens)
-            .filter(|&(_, sim)| sim >= self.options.sim_threshold)
-            .map(|(id, _)| id)
+            .filter(|(_, sim, _)| *sim >= self.options.sim_threshold)
+            .map(|(id, _, _)| id)
     }
 
     /// Match a line and, on a hit, return the captured wildcard-position values
@@ -324,10 +332,12 @@ impl Miner {
     /// Used by `restore`. Assumes `id` is not already present.
     fn insert_existing(&self, inner: ClusterInner) {
         let count = inner.tokens.len();
-        // Build a borrowed token view for descent-key computation, scoped so its
-        // borrow of `inner.tokens` ends before `inner` is moved below. `keys` is
-        // owned (Arc<str>), so it outlives the view.
-        let keys = {
+        let id = inner.id;
+        let shard = self.shard_for(count);
+        let mut guard = shard.write().expect("shard lock poisoned");
+        {
+            // `view` borrows `inner.tokens` and `keys` borrows `view`; both must
+            // outlive the descent, so this block ends before `inner` is moved.
             let view: SmallVec<[Token<'_>; 16]> = inner
                 .tokens
                 .iter()
@@ -337,17 +347,14 @@ impl Miner {
                     trailing_delim: t.trailing_delim,
                 })
                 .collect();
-            self.descent_keys(&view)
-        };
-        let id = inner.id;
-        let shard = self.shard_for(count);
-        let mut guard = shard.write().expect("shard lock poisoned");
-        let leaf = guard
-            .root
-            .descend_or_create(&keys, self.options.max_clusters_per_leaf);
+            let keys = self.descent_keys(&view);
+            let leaf = guard
+                .root
+                .descend_or_create(&keys, self.options.max_clusters_per_leaf);
+            self.evict_if_full(leaf);
+            leaf.insert(id);
+        }
         self.clusters_by_id.insert(id, Arc::new(RwLock::new(inner)));
-        self.evict_if_full(leaf);
-        leaf.insert(id);
     }
 
     /// Serialize miner state (options + counter + flat cluster list) to bytes.
@@ -411,6 +418,7 @@ impl Miner {
                 size: AtomicU64::new(cs.size),
                 created_at: ms_to_system_time(cs.created_at_ms),
                 updated_at_ms: AtomicU64::new(cs.updated_at_ms),
+                last_used: AtomicU64::new(0),
                 suffix: cs.suffix.map(Arc::from),
                 members: cs.members.into_iter().map(Arc::from).collect(),
             };
@@ -644,5 +652,28 @@ mod tests {
         m.add("GET /u/410/x"); // generalize middle to <*>
         let (_, params) = m.extract("GET /u/777/x").unwrap();
         assert_eq!(params, vec!["777".to_string()]);
+    }
+
+    #[test]
+    fn full_leaf_evicts_least_recently_used() {
+        // These lines share the first two tokens ("p q") -> same leaf, but are
+        // pairwise dissimilar (2/6) -> distinct clusters in that one leaf.
+        let m = miner_with(MinerBuilder::new().max_clusters_per_leaf(2));
+        m.add("p q a b c d"); // cluster A
+        m.add("p q e f g h"); // cluster B
+        assert_eq!(m.len(), 2);
+        m.add("p q a b c d"); // touch A -> B is now least-recently-used
+        m.add("p q i j k l"); // cluster C -> leaf full -> evict the LRU (B)
+
+        assert_eq!(m.len(), 2, "per-leaf cap bounds cluster count via eviction");
+        assert!(
+            m.match_only("p q a b c d").is_some(),
+            "recently-used A retained"
+        );
+        assert!(m.match_only("p q i j k l").is_some(), "new C retained");
+        assert!(
+            m.match_only("p q e f g h").is_none(),
+            "least-recently-used B evicted"
+        );
     }
 }

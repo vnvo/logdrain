@@ -26,10 +26,12 @@ fn now_ms() -> u64 {
 
 /// Mutable cluster body. Stored as `Arc<RwLock<ClusterInner>>` in the miner.
 ///
-/// `size` and `updated_at_ms` are atomics so the hot match path can bump a hit
-/// through a shared (read) lock without taking the exclusive cluster lock;
-/// `tokens` and `members` change rarely and stay behind the `RwLock`'s write
-/// guard. `updated_at_ms` doubles as the LRU recency key.
+/// `size`, `updated_at_ms`, and `last_used` are atomics so the hot match path can
+/// bump a hit through a shared (read) lock without taking the exclusive cluster
+/// lock; `tokens` and `members` change rarely and stay behind the `RwLock`'s
+/// write guard. `last_used` is a monotonic tick (not wall-clock) used as the LRU
+/// recency key, so eviction order is precise even when many hits land in the same
+/// millisecond.
 #[derive(Debug)]
 pub(crate) struct ClusterInner {
     pub(crate) id: ClusterId,
@@ -37,6 +39,7 @@ pub(crate) struct ClusterInner {
     pub(crate) size: AtomicU64,
     pub(crate) created_at: SystemTime,
     pub(crate) updated_at_ms: AtomicU64,
+    pub(crate) last_used: AtomicU64,
     /// Verbatim remainder after the first line (set at creation in first-line mode).
     pub(crate) suffix: Option<Arc<str>>,
     /// Deduplicated member labels recorded via `add_with_member`.
@@ -57,21 +60,24 @@ impl ClusterInner {
             size: AtomicU64::new(1),
             created_at: now,
             updated_at_ms: AtomicU64::new(unix_ms(now)),
+            last_used: AtomicU64::new(0),
             suffix,
             members: Vec::new(),
         }
     }
 
-    /// Record a hit: increment size and refresh recency. Safe through a shared
-    /// reference (atomics), so callers need only the cluster read lock.
-    pub(crate) fn touch(&self) {
+    /// Record a hit: increment size, refresh the wall-clock `updated_at`, and set
+    /// the LRU recency to `tick` (a monotonic value supplied by the miner). Safe
+    /// through a shared reference (atomics), so callers need only the read lock.
+    pub(crate) fn touch(&self, tick: u64) {
         self.size.fetch_add(1, Ordering::Relaxed);
         self.updated_at_ms.store(now_ms(), Ordering::Relaxed);
+        self.last_used.store(tick, Ordering::Relaxed);
     }
 
-    /// LRU recency key (last-updated unix-millis).
+    /// LRU recency key (monotonic tick; higher = more recently used).
     pub(crate) fn recency(&self) -> u64 {
-        self.updated_at_ms.load(Ordering::Relaxed)
+        self.last_used.load(Ordering::Relaxed)
     }
 
     /// Whether generalizing against `incoming` would change the template. Read-only,

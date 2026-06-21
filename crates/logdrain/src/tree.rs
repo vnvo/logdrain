@@ -68,11 +68,7 @@ impl TreeNode {
 
     /// Descend `keys` from this node, creating internal nodes and the terminal
     /// leaf (bounded by `leaf_cap`) as needed. Returns a mutable ref to the leaf.
-    pub(crate) fn descend_or_create(
-        &mut self,
-        keys: &[Arc<str>],
-        leaf_cap: usize,
-    ) -> &mut LeafBucket {
+    pub(crate) fn descend_or_create(&mut self, keys: &[&str], leaf_cap: usize) -> &mut LeafBucket {
         match keys.split_first() {
             None => {
                 // No more keys: this node must be (or become) the leaf.
@@ -89,27 +85,34 @@ impl TreeNode {
                     TreeNode::Internal { children } => children,
                     TreeNode::Leaf(_) => unreachable!("internal/leaf depth is fixed per shard"),
                 };
-                let next = children.entry(head.clone()).or_insert_with(|| {
-                    if rest.is_empty() {
+                // Allocate an owned `Arc<str>` key only when the child is new (the
+                // create path); existing children are reached without allocating.
+                if !children.contains_key(*head) {
+                    let node = if rest.is_empty() {
                         TreeNode::Leaf(LeafBucket::new(leaf_cap))
                     } else {
                         TreeNode::new_internal()
-                    }
-                });
-                next.descend_or_create(rest, leaf_cap)
+                    };
+                    children.insert(Arc::from(*head), node);
+                }
+                children
+                    .get_mut(*head)
+                    .expect("child just inserted or already present")
+                    .descend_or_create(rest, leaf_cap)
             }
         }
     }
 
     /// Read-only descent: returns the leaf if the full path exists, else `None`.
-    pub(crate) fn descend(&self, keys: &[Arc<str>]) -> Option<&LeafBucket> {
+    /// Keys are borrowed `&str`, so matching never allocates.
+    pub(crate) fn descend(&self, keys: &[&str]) -> Option<&LeafBucket> {
         match keys.split_first() {
             None => match self {
                 TreeNode::Leaf(b) => Some(b),
                 TreeNode::Internal { .. } => None,
             },
             Some((head, rest)) => match self {
-                TreeNode::Internal { children } => children.get(head)?.descend(rest),
+                TreeNode::Internal { children } => children.get(*head)?.descend(rest),
                 TreeNode::Leaf(_) => None,
             },
         }
@@ -138,7 +141,7 @@ mod tests {
     #[test]
     fn descend_creates_path_and_returns_leaf() {
         let mut root = TreeNode::new_internal();
-        let keys = [Arc::from("GET"), Arc::from("/api")];
+        let keys = ["GET", "/api"];
         root.descend_or_create(&keys, 100).insert(1);
         // Descending the same path again reaches the same leaf.
         let leaf2 = root.descend_or_create(&keys, 100);
@@ -148,17 +151,16 @@ mod tests {
     #[test]
     fn descend_readonly_misses_on_absent_path() {
         let mut root = TreeNode::new_internal();
-        let keys = [Arc::from("GET")];
+        let keys = ["GET"];
         root.descend_or_create(&keys, 100).insert(1);
-        let other = [Arc::from("POST")];
-        assert!(root.descend(&other).is_none());
+        assert!(root.descend(&["POST"]).is_none());
         assert!(root.descend(&keys).is_some());
     }
 
     #[test]
     fn empty_keys_make_root_a_leaf() {
         let mut root = TreeNode::new_internal();
-        let keys: [Arc<str>; 0] = [];
+        let keys: [&str; 0] = [];
         root.descend_or_create(&keys, 5).insert(1);
         assert_eq!(root.descend(&keys).unwrap().ids(), &[1]);
     }
