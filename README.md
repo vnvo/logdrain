@@ -28,18 +28,33 @@ the roadmap, not yet implemented.
 
 ## Features
 
+Beyond the core Drain algorithm, logdrain adds the things you actually need to run
+template mining in production:
+
 - **Online & incremental** - `add(line)` returns immediately with a cluster id and
-  whether the template was created, generalized, or matched unchanged.
+  whether the template was created, generalized, or matched unchanged. No batch
+  training step, no model files.
 - **Path-preserving tokenization** - `/servers/409/foo` clusters to
   `/servers/<*>/foo`, not `<*>`; delimiters are retained through generalization.
-- **Masks** - a regex pre-pass replaces high-cardinality tokens with named
-  placeholders before clustering. Built-ins: `uuid`, `hex32`, `email`, `ipv4`,
-  `jwt`; custom masks are a `Mask::new(pattern, placeholder)` away.
-- **Stack-trace clustering** - `first_line_only` mode clusters on the first line and
-  keeps the rest of each trace verbatim as a per-cluster suffix.
-- **Numeric parametrization, members, parameter extraction, snapshot/restore.**
+  Keeps API/URL/structured logs readable instead of collapsing them to noise.
+- **Configurable masks** - a regex pre-pass replaces high-cardinality tokens with
+  named placeholders before clustering. Built-ins: `uuid`, `hex32`, `email`,
+  `ipv4`, `jwt`; custom masks via `Mask::new(pattern, placeholder)`.
+- **Stack-trace clustering** - `first_line_only` mode clusters multi-line traces on
+  their first line and keeps the rest of each trace verbatim as a per-cluster suffix.
+- **Numeric parametrization** - pure-number tokens generalize to the wildcard.
+- **Parameter extraction** - `extract()` pulls the variable values back out of a
+  matched line.
+- **Members** - attach and de-duplicate labels (host, service, …) per cluster.
+- **Exhaustive & persistent** - every template is kept with an exact count (no
+  sampling, no top-N truncation); sync `snapshot`/`restore` with a pluggable backend
+  (Memory + File in core) keeps that catalog for as long as you keep the state.
+- **Thread-safe & concurrent** - `add(&self)` from many threads; the tree shards by
+  token count and the match path runs under a shared read lock.
 - **Streaming memory** - lines are never retained; footprint scales with the number
   of distinct templates (bounded by a per-leaf LRU), not with lines ingested.
+- **Embeddable & dependency-light** - a small Rust library you drop into your own
+  pipeline. No service to run, no vendor, no storage assumptions.
 
 ## Library quick start
 
@@ -125,21 +140,16 @@ cargo run --release -p logdrain --example highvolume -- 5000000   # scale + thro
 
 ## Performance
 
-Single-threaded, on synthetic data (`cargo bench -p logdrain --bench add`):
+Tested numbers from one mid-range Linux box — they **vary with hardware and load**,
+so treat them as orders of magnitude and re-run on your own target.
 
-| operation | latency |
-|---|---|
-| steady-state `add` (warm tree) | ~370 ns |
-| cold-start `add` (every line new) | ~1.8 µs |
-| `match_only` (read-only classify) | ~290 ns |
-
-The `highvolume` example ingests **5M lines in ~2.9s (~1.7M lines/sec)**, collapsing
-to 8 templates. Streaming a file through the CLI holds the whole process in single-digit
-MB regardless of line count, because the miner retains templates, not lines.
-
-The concurrency model shards the tree by token count (each shard behind its own
-lock) so independent shapes don't contend - but the numbers above are single-thread;
-a multi-core benchmark isn't in yet.
+- **Latency** (criterion, `cargo bench -p logdrain --bench add`): steady `add` ~0.3 µs,
+  cold-start `add` ~1.8 µs, `match_only` ~0.25 µs.
+- **Throughput** (bundled examples, single timed run): **~1–2M lines/sec single-thread**,
+  scaling to **multi-M lines/sec across cores** (~3.3× on 8). Sub-linear; the ceiling
+  is contention on hot shared template counters.
+- **Memory** is bounded by template count, not input: streaming a file through the CLI
+  stays in single-digit MB regardless of line count.
 
 ## MSRV & license
 
