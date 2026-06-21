@@ -104,6 +104,18 @@ mod tests {
         let id = m2.match_only("user 7 logged in").unwrap();
         assert_eq!(m2.cluster(id).unwrap().template(), "user <*> logged in");
 
+        // Timestamps survive the round-trip (to millisecond precision).
+        let ms =
+            |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let before = m.cluster(id).unwrap();
+        let after_c = m2.cluster(id).unwrap();
+        assert_eq!(ms(before.created_at()), ms(after_c.created_at()));
+        assert_eq!(ms(before.updated_at()), ms(after_c.updated_at()));
+        assert!(
+            ms(after_c.created_at()) > 0,
+            "timestamp must be a real epoch-ms value"
+        );
+
         // Counter survived: the next new cluster id is strictly greater.
         let after = m2.add("yet another different shape entirely").cluster_id;
         assert!(after > next_id_before, "{after} !> {next_id_before}");

@@ -214,6 +214,8 @@ mod tests {
             .max_clusters_per_leaf(0)
             .build_options()
             .is_err());
+        // depth == 2 is the minimum valid value and must build.
+        assert!(MinerBuilder::new().depth(2).build_options().is_ok());
     }
 
     #[test]

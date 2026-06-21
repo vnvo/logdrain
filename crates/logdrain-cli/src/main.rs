@@ -139,3 +139,32 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_masks_parses_known_and_rejects_unknown() {
+        assert_eq!(build_masks("uuid,ipv4").unwrap().len(), 2);
+        assert!(build_masks("").unwrap().is_empty());
+        assert!(build_masks("uuid,bogus").is_err());
+    }
+
+    #[test]
+    fn ingest_line_skips_blank_extracts_json_and_adds_raw() {
+        let m = Miner::builder().build().unwrap();
+
+        ingest_line(&m, "   ", None); // blank -> skipped
+        assert_eq!(m.len(), 0);
+
+        ingest_line(&m, "plain text line", None); // raw -> added
+        assert_eq!(m.len(), 1);
+
+        ingest_line(&m, r#"{"msg":"hello world"}"#, Some("msg")); // JSON field extracted
+        assert!(m.match_only("hello world").is_some());
+
+        ingest_line(&m, "not json", Some("msg")); // unparseable under --key -> skipped
+        assert!(m.match_only("not json").is_none());
+    }
+}
