@@ -11,7 +11,7 @@ clustering - as an embeddable library and a CLI.
 [![crates.io](https://img.shields.io/crates/v/logdrain.svg)](https://crates.io/crates/logdrain)
 [![docs.rs](https://img.shields.io/docsrs/logdrain)](https://docs.rs/logdrain)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/rustc-1.80%2B-orange.svg)](#license)
+[![MSRV](https://img.shields.io/badge/rustc-1.85%2B-orange.svg)](#license)
 
 </div>
 
@@ -196,4 +196,4 @@ cargo fmt --all --check
 ## ⚖️  License
 
 Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your
-option. Minimum supported Rust version: **1.80**.
+option. Minimum supported Rust version: **1.85**.
