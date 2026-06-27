@@ -4,7 +4,7 @@ members = ["crates/logdrain", "crates/logdrain-cli"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/vnvo/logdrain"
 authors = ["logdrain authors"]
