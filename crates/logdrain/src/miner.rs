@@ -201,7 +201,7 @@ impl Miner {
                     let body = entry.read().expect("cluster lock poisoned");
                     similarity(&body.tokens, tokens, &self.options.wildcard)
                 };
-                if best.as_ref().map_or(true, |(_, b, _)| sim > *b) {
+                if best.as_ref().is_none_or(|(_, b, _)| sim > *b) {
                     best = Some((id, sim, entry.value().clone()));
                 }
             }
