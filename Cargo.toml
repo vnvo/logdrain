@@ -6,7 +6,7 @@ members = ["crates/logdrain", "crates/logdrain-cli"]
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/USER/logdrain"
+repository = "https://github.com/vnvo/logdrain"
 authors = ["logdrain authors"]
 
 [workspace.dependencies]
