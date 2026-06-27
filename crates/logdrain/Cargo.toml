@@ -1,6 +1,6 @@
 [package]
 name = "logdrain"
-version = "0.1.0"
+version = "0.3.0"
 description = "Online Drain3 log-template mining with path-preserving tokenization"
 edition.workspace = true
 rust-version.workspace = true
@@ -25,18 +25,4 @@ criterion = "0.5"
 name = "add"
 harness = false
 
-[[example]]
-name = "basic"
-path = "../../examples/basic.rs"
-
-[[example]]
-name = "stacktrace"
-path = "../../examples/stacktrace.rs"
-
-[[example]]
-name = "highvolume"
-path = "../../examples/highvolume.rs"
-
-[[example]]
-name = "scaling"
-path = "../../examples/scaling.rs"
+# Examples are auto-discovered from `examples/`.
