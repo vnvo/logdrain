@@ -1,132 +1,110 @@
+<div align="center">
+
 # logdrain
+
+**High-throughput, online log-template mining in Rust.**
+
+The Drain3 algorithm with path-preserving tokenization, masks, and stack-trace
+clustering - as an embeddable library and a CLI.
 
 [![CI](https://github.com/vnvo/logdrain/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/logdrain/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/logdrain.svg)](https://crates.io/crates/logdrain)
 [![docs.rs](https://img.shields.io/docsrs/logdrain)](https://docs.rs/logdrain)
-[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#msrv--license)
-[![MSRV](https://img.shields.io/badge/rustc-1.80%2B-orange.svg)](#msrv--license)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/rustc-1.80%2B-orange.svg)](#license)
 
-High-throughput, online log-template mining in Rust - the `Drain3` algorithm with
-path-preserving tokenization, configurable masks, and stack-trace clustering.
+</div>
 
-`logdrain` turns a stream of noisy log lines into a small set of templates. Feed it
-lines; it returns a cluster id per line and learns templates incrementally - no
-batch training step, no model files.
+---
+
+Feed `logdrain` a stream of noisy log lines and it learns their **templates**
+incrementally - returning a cluster id per line, with no batch training and no model
+files.
 
 ```text
 GET /api/v1/servers/409/metrics 200 12ms   ┐
-GET /api/v1/servers/410/metrics 200  9ms   ├─>  GET /api/v1/servers/<*>/metrics <*> <*>
+GET /api/v1/servers/410/metrics 200  9ms   ├─►  GET /api/v1/servers/<*>/metrics <*> <*>
 GET /api/v1/servers/873/metrics 503 41ms   ┘
 request 550e8400-…-446655440000 done 88ms  ┐
-request 6ba7b810-…-00c04fd430c8 done 51ms  ├─>  request <uuid> done <*>
+request 6ba7b810-…-00c04fd430c8 done 51ms  ├─►  request <uuid> done <*>
 request 7c9e6679-…-e07fc1f90ae7 done 75ms  ┘
 ```
 
-## Status
+> **5,000,000 noisy lines → 8 templates in ~2 s on a single core.** Memory tracks
+> the number of templates, not the volume of input.
 
-Two crates are built and tested:
+## ✨ Features
 
-- **`logdrain`** : the core library (online miner, tokenizer, masks, persistence).
-- **`logdrain-cli`** : the `logdrain` command-line tool.
+#### Online & incremental
+`add(line)` returns a cluster id instantly - *created*, *generalized*, or *matched*. No batch step.
 
-An HTTP service (`draind`) and out-of-tree persistence backends (Redis, S3) are on
-the roadmap, not yet implemented.
+#### Path-preserving tokenization
+`/servers/409/foo` clusters to `/servers/<*>/foo`, not `<*>`. URLs and structured logs stay readable.
 
-## Features
+#### Configurable masks
+UUIDs, IPs, emails, JWTs → named placeholders before clustering - built-in or custom.
 
-Beyond the core Drain algorithm, logdrain adds the things you actually need to run
-template mining in production:
+#### Stack-trace clustering
+Cluster multi-line traces on their first line and keep the full trace as a per-cluster suffix.
 
-- **Online & incremental** - `add(line)` returns immediately with a cluster id and
-  whether the template was created, generalized, or matched unchanged. No batch
-  training step, no model files.
-- **Path-preserving tokenization** - `/servers/409/foo` clusters to
-  `/servers/<*>/foo`, not `<*>`; delimiters are retained through generalization.
-  Keeps API/URL/structured logs readable instead of collapsing them to noise.
-- **Configurable masks** - a regex pre-pass replaces high-cardinality tokens with
-  named placeholders before clustering. Built-ins: `uuid`, `hex32`, `email`,
-  `ipv4`, `jwt`; custom masks via `Mask::new(pattern, placeholder)`.
-- **Stack-trace clustering** - `first_line_only` mode clusters multi-line traces on
-  their first line and keeps the rest of each trace verbatim as a per-cluster suffix.
-- **Numeric parametrization** - pure-number tokens generalize to the wildcard.
-- **Parameter extraction** - `extract()` pulls the variable values back out of a
-  matched line.
-- **Members** - attach and de-duplicate labels (host, service, …) per cluster.
-- **Exhaustive & persistent** - every template is kept with an exact count (no
-  sampling, no top-N truncation); sync `snapshot`/`restore` with a pluggable backend
-  (Memory + File in core) keeps that catalog for as long as you keep the state.
-- **Thread-safe & concurrent** - `add(&self)` from many threads; the tree shards by
-  token count and the match path runs under a shared read lock.
-- **Streaming memory** - lines are never retained; footprint scales with the number
-  of distinct templates (bounded by a per-leaf LRU), not with lines ingested.
-- **Embeddable & dependency-light** - a small Rust library you drop into your own
-  pipeline. No service to run, no vendor, no storage assumptions.
+#### Extraction & members
+`extract()` recovers the variable values of a line; attach de-duplicated labels per cluster.
 
-## Library quick start
+#### Exhaustive & persistent
+Exact per-template counts (no sampling, no top-N) with `snapshot`/`restore` to a pluggable backend.
 
-```sh
-cargo add logdrain
-```
+#### Thread-safe & fast
+`add(&self)` from many threads; a sharded, mostly-lock-free hot path (~1-2M lines/sec per core).
 
-```rust
-use logdrain::{builtin_masks, Miner};
+## 💡 Use cases
 
-let miner = Miner::builder()
-    .path_delimiters(&['/'])
-    .masks([builtin_masks::uuid(), builtin_masks::ipv4()])
-    .sim_threshold(0.4)
-    .build()
-    .unwrap();
+#### Noise reduction & triage
+Collapse millions of lines into a handful of templates, ranked by volume, to see what's *actually* happening.
 
-miner.add("GET /api/v1/servers/409/metrics from 10.0.0.1");
-miner.add("GET /api/v1/servers/410/metrics from 10.0.0.2");
+#### New-pattern alerting
+Alert on the `Created` signal - the first time a never-seen log shape appears (new errors, attacks, regressions).
 
-for c in miner.clusters() {
-    println!("#{} x{}  {}", c.id(), c.size(), c.template());
-    // => #1 x2  GET /api/v1/servers/<*>/metrics from <ipv4>
-}
+#### Incident & exception clustering
+Rank distinct stack-trace failures by frequency, so you triage the top one instead of scrolling.
 
-// Classify a new line and pull out the variable parts.
-let (id, params) = miner.extract("GET /api/v1/servers/777/metrics from 10.0.0.9").unwrap();
-assert_eq!(params, ["777"]); // <ipv4> is a named placeholder, not a wildcard
-```
+#### Pipeline cost reduction
+Store `(template, count)` instead of raw lines, or sample by template - a Vector/Cribl-style stage.
 
-### Persistence
+#### Structured extraction
+Turn unstructured logs into `(template_id, params)` for dashboards, ML features, or alerting.
 
-```rust
-use logdrain::{FilePersistence, Miner};
+#### Edge / agent summarization
+Embed it in a log shipper to summarize at the source and cut egress and ingest cost.
 
-let store = FilePersistence::new("templates.bin");
-miner.save_state(&store).unwrap();        // atomic write (tmp + fsync + rename)
-
-let restored = Miner::builder().build().unwrap();
-restored.load_state(&store).unwrap();     // rebuilds the tree from the snapshot
-```
-
-`Persistence` is a small sync trait; `MemoryPersistence` and `FilePersistence` ship
-in core, and `Miner::{snapshot, restore}` expose the raw bytes if you want to store
-them elsewhere.
-
-## CLI
+## 📦 Install
 
 ```sh
-cargo install logdrain-cli          # installs the `logdrain` binary on $PATH
-# or, from this repo:
-cargo run -p logdrain-cli -- [OPTIONS] [FILES]...
+cargo add logdrain                  # the library
+cargo install logdrain-cli          # the `logdrain` CLI, on your $PATH
 ```
 
-Reads the given files, or stdin if none. One log record per line.
+## 🖥️  CLI
+
+Reads files (or stdin), one record per line, and prints the templates it found:
+
+```console
+$ logdrain --path-delimiters / --masks uuid,ipv4,email access.log
+ID  SIZE  TEMPLATE
+ 1     5  GET /api/v1/servers/<*>/metrics <*> <*>
+ 2     4  POST /api/v1/users/<*>/login <*> from <ipv4>
+ 3     4  request <uuid> completed in <*>
+ 4     4  signup for <email> from <ipv4>
+ 5     4  cache miss for key <*>
+ …          (30 lines → 9 templates)
+```
 
 ```sh
-# Cluster an access log, preserving paths and masking ids
-logdrain --path-delimiters / --masks uuid,ipv4,email access.log
-
-# JSON output, largest clusters first
-cat app.log | logdrain --format json --sort size
-
-# Pull the message out of JSON lines first
-cat events.ndjson | logdrain --key event.message
+cat app.log | logdrain --format json --sort size   # JSON, biggest clusters first
+cat events.ndjson | logdrain --key event.message    # pull a field out of JSON lines
 ```
+
+<details>
+<summary><b>All CLI options</b></summary>
 
 | Option | Description |
 |---|---|
@@ -140,28 +118,82 @@ cat events.ndjson | logdrain --key event.message
 | `--sim-th <FLOAT>` | similarity threshold (default `0.4`) |
 | `--depth <N>` | prefix-tree depth (default `4`) |
 
-## Examples
+</details>
 
-```sh
-cargo run -p logdrain --example basic        # masks, paths, params on readable data
-cargo run -p logdrain --example stacktrace   # multi-line traces -> ranked failures
-cargo run --release -p logdrain --example highvolume -- 5000000   # single-thread throughput
-cargo run --release -p logdrain --example scaling                 # multi-core scaling table
+## 📚 Library
+
+```rust
+use logdrain::{builtin_masks, Miner};
+
+let miner = Miner::builder()
+    .path_delimiters(&['/'])
+    .masks([builtin_masks::uuid(), builtin_masks::ipv4()])
+    .build()
+    .unwrap();
+
+miner.add("GET /api/v1/servers/409/metrics from 10.0.0.1");
+miner.add("GET /api/v1/servers/410/metrics from 10.0.0.2");
+
+for c in miner.clusters() {
+    println!("#{} x{}  {}", c.id(), c.size(), c.template());
+    // => #1 x2  GET /api/v1/servers/<*>/metrics from <ipv4>
+}
+
+// Classify a new line and recover its variable parts.
+let (_id, params) = miner.extract("GET /api/v1/servers/777/metrics from 10.0.0.9").unwrap();
+assert_eq!(params, ["777"]); // <ipv4> is a named placeholder, not a wildcard
 ```
 
-## Performance
+<details>
+<summary><b>Persisting state</b></summary>
 
-Tested numbers from one mid-range Linux box — they **vary with hardware and load**,
-so treat them as orders of magnitude and re-run on your own target.
+```rust
+use logdrain::{FilePersistence, Miner};
 
-- **Latency** (criterion, `cargo bench -p logdrain --bench add`): steady `add` ~0.3 µs,
-  cold-start `add` ~1.8 µs, `match_only` ~0.25 µs.
-- **Throughput** (bundled examples, single timed run): **~1–2M lines/sec single-thread**,
-  scaling to **multi-M lines/sec across cores** (~3.3× on 8). Sub-linear; the ceiling
-  is contention on hot shared template counters.
-- **Memory** is bounded by template count, not input: streaming a file through the CLI
-  stays in single-digit MB regardless of line count.
+let store = FilePersistence::new("templates.bin");
+miner.save_state(&store).unwrap();        // atomic write (tmp + fsync + rename)
 
-## MSRV & license
+let restored = Miner::builder().build().unwrap();
+restored.load_state(&store).unwrap();     // rebuilds the tree from the snapshot
+```
 
-Rust 1.80+. Licensed under either of Apache-2.0 or MIT, at your option.
+`Persistence` is a small sync trait; `MemoryPersistence` and `FilePersistence` ship in
+core, and `Miner::{snapshot, restore}` expose the raw bytes for any other backend.
+
+</details>
+
+## ⚡ Performance
+
+Numbers from one mid-range Linux box - they **vary with hardware and load**, so treat
+them as orders of magnitude and re-run on your own target.
+
+| | |
+|---|---|
+| Throughput (single thread) | **~1-2M lines/sec** |
+| Throughput (8 threads) | multi-M lines/sec (~3.3× scaling) |
+| `add` latency (steady / cold) | ~0.3 µs / ~1.8 µs |
+| Memory | bounded by template count, not input |
+
+Reproduce: `cargo bench -p logdrain --bench add`, or
+`cargo run --release -p logdrain --example scaling`.
+
+## 🗺️  Status & roadmap
+
+**Available:** `logdrain` (library) and `logdrain-cli`, published and tested.
+**Roadmap:** an HTTP service (`draind`), Redis/S3 persistence backends, and
+hierarchical/distributed aggregation.
+
+## 🤝 Contributing
+
+Issues and pull requests welcome. Please keep the standard checks green:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+## ⚖️  License
+
+Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your
+option. Minimum supported Rust version: **1.80**.
