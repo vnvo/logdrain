@@ -27,6 +27,16 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check tag matches crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version = ' crates/logdrain/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match logdrain crate version $crate"
+            exit 1
+          fi
+
       - name: Verify before publishing
         run: |
           cargo fmt --all --check

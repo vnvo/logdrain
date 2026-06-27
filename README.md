@@ -1,9 +1,10 @@
 # logdrain
 
 [![CI](https://github.com/vnvo/logdrain/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/logdrain/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/logdrain.svg)](https://crates.io/crates/logdrain)
+[![docs.rs](https://img.shields.io/docsrs/logdrain)](https://docs.rs/logdrain)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#msrv--license)
 [![MSRV](https://img.shields.io/badge/rustc-1.80%2B-orange.svg)](#msrv--license)
-[![Built with](https://img.shields.io/badge/built%20with-Rust-dea584.svg)](https://www.rust-lang.org)
 
 High-throughput, online log-template mining in Rust - the `Drain3` algorithm with
 path-preserving tokenization, configurable masks, and stack-trace clustering.
@@ -63,6 +64,10 @@ template mining in production:
 
 ## Library quick start
 
+```sh
+cargo add logdrain
+```
+
 ```rust
 use logdrain::{builtin_masks, Miner};
 
@@ -105,9 +110,9 @@ them elsewhere.
 ## CLI
 
 ```sh
-# from this repo
+cargo install logdrain-cli          # installs the `logdrain` binary on $PATH
+# or, from this repo:
 cargo run -p logdrain-cli -- [OPTIONS] [FILES]...
-cargo install --path crates/logdrain-cli   # installs the `logdrain` binary on $PATH
 ```
 
 Reads the given files, or stdin if none. One log record per line.
