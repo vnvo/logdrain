@@ -1,7 +1,8 @@
 [package]
 name = "logdrain"
-version = "0.1.0"
+version = "0.1.1"
 description = "Online Drain3 log-template mining with path-preserving tokenization"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
