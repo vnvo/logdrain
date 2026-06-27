@@ -45,15 +45,35 @@ jobs:
 
       # The library must be published before the CLI, which depends on it.
       # `cargo publish` waits for the new version to be indexed before returning.
+      # Each step is idempotent: a version already on crates.io is skipped, so
+      # re-running a release (or tagging an already-published version) is safe.
       - name: Publish logdrain
-        run: cargo publish -p logdrain
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ver=$(grep -m1 '^version = ' crates/logdrain/Cargo.toml | cut -d'"' -f2)
+          code=$(curl -sL -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: logdrain-release (github.com/vnvo)" \
+            "https://crates.io/api/v1/crates/logdrain/$ver")
+          if [ "$code" = "200" ]; then
+            echo "logdrain $ver already on crates.io - skipping"
+          else
+            cargo publish -p logdrain
+          fi
 
       - name: Publish logdrain-cli
-        run: cargo publish -p logdrain-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ver=$(grep -m1 '^version = ' crates/logdrain-cli/Cargo.toml | cut -d'"' -f2)
+          code=$(curl -sL -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: logdrain-release (github.com/vnvo)" \
+            "https://crates.io/api/v1/crates/logdrain-cli/$ver")
+          if [ "$code" = "200" ]; then
+            echo "logdrain-cli $ver already on crates.io - skipping"
+          else
+            cargo publish -p logdrain-cli
+          fi
 
       - name: Create GitHub Release
         run: gh release create "${{ github.ref_name }}" --generate-notes --verify-tag
