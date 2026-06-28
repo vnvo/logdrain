@@ -1,8 +1,10 @@
 [package]
 name = "logdrain-cli"
-version = "0.3.1"
+version = "0.3.2"
 description = "Command-line log-template miner (ships the `logdrain` binary)"
 readme = "README.md"
+keywords = ["logs", "observability", "drain", "log-parsing", "cli"]
+categories = ["command-line-utilities", "parsing", "text-processing"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
