@@ -52,5 +52,10 @@ jobs:
             libssl-dev libsasl2-dev libzstd-dev zlib1g-dev libcurl4-openssl-dev
       - name: clippy (redis + kafka)
         run: cargo clippy -p logdrain --features redis,kafka --all-targets -- -D warnings
-      - name: test (redis + kafka; broker tests are #[ignore])
+      - name: unit tests (redis + kafka)
         run: cargo test -p logdrain --features redis,kafka
+      # Functional tests spin up real Redis + Kafka via testcontainers (Docker is
+      # available on GitHub-hosted runners). These are #[ignore] so they don't run
+      # in environments without Docker.
+      - name: functional backend tests (testcontainers)
+        run: cargo test -p logdrain --features redis,kafka -- --ignored

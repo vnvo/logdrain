@@ -53,7 +53,7 @@ Cluster multi-line traces on their first line and keep the full trace as a per-c
 Feed a parsed timestamp per line (`add_at`, or the CLI's `--time-key`) for true event-time first/last-seen and rates, independent of processing wall-clock.
 
 #### Exhaustive & persistent
-Exact per-template counts (no sampling, no top-N) with `snapshot`/`restore` to a pluggable backend.
+Exact per-template counts (no sampling, no top-N) with `snapshot`/`restore` to a pluggable backend - in-memory, file, or Redis/Kafka behind features.
 
 #### Thread-safe & fast
 `add(&self)` from many threads; a sharded, mostly-lock-free hot path (~1-2M lines/sec per core).
@@ -280,6 +280,10 @@ assert_eq!(params, ["777"]); // <ipv4> is a named placeholder, not a wildcard
 
 <details>
 <summary><b>Persisting state</b></summary>
+
+Persistence is a **library** API - `Miner::{save_state, load_state}`; the CLI does not
+persist. Writes are caller-driven (no background flush) and each one is a *full* snapshot
+of the current catalog, so you checkpoint on a timer, on shutdown, or every N lines.
 
 ```rust
 use logdrain::{FilePersistence, Miner};

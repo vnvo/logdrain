@@ -32,6 +32,9 @@ kafka = ["dep:rdkafka"]
 [dev-dependencies]
 proptest = "1"
 criterion = "0.5"
+# Functional backend tests spin up real Redis/Kafka via Docker (testcontainers).
+testcontainers = { version = "0.23", features = ["blocking"] }
+testcontainers-modules = { version = "0.11", features = ["redis", "kafka"] }
 
 [[bench]]
 name = "add"

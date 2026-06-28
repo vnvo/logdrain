@@ -292,32 +292,12 @@ mod tests {
         assert!(!m.load_state(&MemoryPersistence::new()).unwrap());
     }
 
+    // Construction-only unit test; full round-trips live in the `tests/` directory and
+    // run a real Redis/Kafka via testcontainers.
     #[cfg(feature = "redis")]
     #[test]
     fn redis_new_validates_url() {
         assert!(RedisPersistence::new("redis://127.0.0.1/", "logdrain:snap").is_ok());
         assert!(RedisPersistence::new("not-a-redis-url", "k").is_err());
-    }
-
-    #[cfg(feature = "redis")]
-    #[test]
-    #[ignore = "requires a running Redis (set REDIS_URL, default redis://127.0.0.1/)"]
-    fn redis_round_trip() {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
-        let p = RedisPersistence::new(&url, "logdrain:test:snap").unwrap();
-        p.save(b"snap-bytes").unwrap();
-        assert_eq!(p.load().unwrap(), Some(b"snap-bytes".to_vec()));
-        p.save(b"newer").unwrap();
-        assert_eq!(p.load().unwrap(), Some(b"newer".to_vec()));
-    }
-
-    #[cfg(feature = "kafka")]
-    #[test]
-    #[ignore = "requires a running Kafka (set KAFKA_BROKERS, default localhost:9092)"]
-    fn kafka_round_trip() {
-        let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
-        let p = KafkaPersistence::new(brokers, "logdrain-test-snap");
-        p.save(b"snap-bytes").unwrap();
-        assert_eq!(p.load().unwrap(), Some(b"snap-bytes".to_vec()));
     }
 }
