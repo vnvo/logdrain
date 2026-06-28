@@ -117,12 +117,30 @@ impl Miner {
 
     /// Ingest a line. Returns the assigned cluster id and what happened.
     pub fn add(&self, line: &str) -> AddResult {
-        self.add_inner(line, None)
+        self.add_inner(line, None, None)
     }
 
     /// Ingest a line, recording `member` on the matched/created cluster (deduped).
     pub fn add_with_member(&self, line: &str, member: &str) -> AddResult {
-        self.add_inner(line, Some(member))
+        self.add_inner(line, Some(member), None)
+    }
+
+    /// Like [`add`](Self::add), but also folds `event_ms` (a unix-millisecond event
+    /// timestamp *you parsed from the log*) into the cluster's event-time window.
+    /// This drives [`Cluster::event_first_seen`], [`event_last_seen`], and
+    /// [`event_lines_per_minute`], which - unlike `created_at`/`lines_per_minute` -
+    /// reflect real event time even when replaying historical data.
+    ///
+    /// [`event_last_seen`]: Cluster::event_last_seen
+    /// [`event_lines_per_minute`]: Cluster::event_lines_per_minute
+    pub fn add_at(&self, line: &str, event_ms: u64) -> AddResult {
+        self.add_inner(line, None, Some(event_ms))
+    }
+
+    /// [`add_at`](Self::add_at) plus a deduplicated `member` label, as in
+    /// [`add_with_member`](Self::add_with_member).
+    pub fn add_with_member_at(&self, line: &str, member: &str, event_ms: u64) -> AddResult {
+        self.add_inner(line, Some(member), Some(event_ms))
     }
 
     /// Shared `add` path: mask -> first-line split -> path tokenize -> match/create.
@@ -130,7 +148,7 @@ impl Miner {
     /// Matching (the common case) runs under the shard *read* lock, so adds that
     /// land in the same shard but match existing templates proceed concurrently.
     /// The shard *write* lock is taken only to create a cluster or grow the tree.
-    fn add_inner(&self, line: &str, member: Option<&str>) -> AddResult {
+    fn add_inner(&self, line: &str, member: Option<&str>, event_ms: Option<u64>) -> AddResult {
         let masked = apply_masks(line, &self.options.masks);
         let (first, suffix) = if self.options.first_line_only {
             split_first_line(&masked)
@@ -152,7 +170,7 @@ impl Miner {
                 .filter(|(_, sim, _)| *sim >= self.options.sim_threshold)
         };
         if let Some((id, _, arc)) = matched {
-            return self.apply_match(&arc, id, &tokens, member);
+            return self.apply_match(&arc, id, &tokens, member, event_ms);
         }
 
         // Phase 2 — create, under the write lock. Holding it prevents concurrent
@@ -165,14 +183,20 @@ impl Miner {
         if let Some((id, sim, arc)) = self.best_match(leaf, &tokens) {
             if sim >= self.options.sim_threshold {
                 drop(guard);
-                return self.apply_match(&arc, id, &tokens, member);
+                return self.apply_match(&arc, id, &tokens, member, event_ms);
             }
         }
 
         // Genuinely new cluster.
         let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let owned: Vec<OwnedToken> = tokens.iter().map(OwnedToken::from).collect();
-        let mut inner = ClusterInner::new(id, owned, SystemTime::now(), suffix.map(Arc::from));
+        let mut inner = ClusterInner::new(
+            id,
+            owned,
+            SystemTime::now(),
+            suffix.map(Arc::from),
+            event_ms,
+        );
         inner.last_used.store(self.next_tick(), Ordering::Relaxed); // mark freshly used
         if let Some(m) = member {
             inner.add_member(m);
@@ -218,10 +242,14 @@ impl Miner {
         id: ClusterId,
         tokens: &[Token<'_>],
         member: Option<&str>,
+        event_ms: Option<u64>,
     ) -> AddResult {
         let needs_generalize = {
             let body = arc.read().expect("cluster lock poisoned");
             body.touch(self.next_tick());
+            if let Some(ms) = event_ms {
+                body.observe_event(ms);
+            }
             body.would_generalize(tokens, &self.options.wildcard)
         };
         if !needs_generalize && member.is_none() {
@@ -378,6 +406,8 @@ impl Miner {
                     size: b.size.load(Ordering::Relaxed),
                     created_at_ms: system_time_to_ms(b.created_at),
                     updated_at_ms: b.updated_at_ms.load(Ordering::Relaxed),
+                    event_first_ms: b.event_first_ms.load(Ordering::Relaxed),
+                    event_last_ms: b.event_last_ms.load(Ordering::Relaxed),
                     suffix: b.suffix.as_ref().map(|s| s.to_string()),
                     members: b.members.iter().map(|m| m.to_string()).collect(),
                 }
@@ -419,6 +449,8 @@ impl Miner {
                 created_at: ms_to_system_time(cs.created_at_ms),
                 updated_at_ms: AtomicU64::new(cs.updated_at_ms),
                 last_used: AtomicU64::new(0),
+                event_first_ms: AtomicU64::new(cs.event_first_ms),
+                event_last_ms: AtomicU64::new(cs.event_last_ms),
                 suffix: cs.suffix.map(Arc::from),
                 members: cs.members.into_iter().map(Arc::from).collect(),
             };
@@ -629,6 +661,43 @@ mod tests {
             m.cluster(a.cluster_id).unwrap().suffix(),
             Some("  at bar()\n  at baz()")
         );
+    }
+
+    #[test]
+    fn add_at_tracks_event_window_and_survives_snapshot() {
+        let m = miner();
+        m.add_at("user 42 logged in", 60_000); // creates; event t = 60s
+        m.add_at("user 99 logged in", 180_000); // joins; event t = 180s (span 120s)
+        let id = m.match_only("user 7 logged in").unwrap();
+        let c = m.cluster(id).unwrap();
+        assert_eq!(
+            c.event_first_seen(),
+            Some(UNIX_EPOCH + Duration::from_millis(60_000))
+        );
+        assert_eq!(
+            c.event_last_seen(),
+            Some(UNIX_EPOCH + Duration::from_millis(180_000))
+        );
+        assert_eq!(c.event_lines_per_minute(), Some(1.0)); // 2 lines / 2 min
+
+        // Event window survives a snapshot round-trip.
+        let bytes = m.snapshot();
+        let m2 = miner();
+        m2.restore(&bytes).unwrap();
+        let c2 = m2
+            .cluster(m2.match_only("user 7 logged in").unwrap())
+            .unwrap();
+        assert_eq!(c2.event_first_seen(), c.event_first_seen());
+        assert_eq!(c2.event_last_seen(), c.event_last_seen());
+    }
+
+    #[test]
+    fn add_without_event_time_leaves_window_unset() {
+        let m = miner();
+        m.add("plain line with no event time");
+        let c = m.cluster(1).unwrap();
+        assert!(c.event_first_seen().is_none());
+        assert!(c.event_lines_per_minute().is_none());
     }
 
     #[test]

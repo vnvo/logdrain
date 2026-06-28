@@ -120,7 +120,18 @@ impl MinerBuilder {
         self
     }
 
-    /// Enable first-line-only clustering (multi-line input keeps a verbatim suffix).
+    /// Cluster each record by its **first line only**, keeping the remainder as a
+    /// per-cluster suffix (taken from the first occurrence).
+    ///
+    /// Off (default): the whole record - every line - is tokenized and clustered.
+    /// On: the record is split at the first newline; only the first line drives
+    /// tokenization, matching, and the template. The rest is stored as the suffix,
+    /// readable via [`Cluster::suffix`](crate::Cluster::suffix), and does not affect
+    /// clustering.
+    ///
+    /// This is how stack traces collapse: the frames differ every time, but the
+    /// first line (exception type + message) is stable. Only meaningful for records
+    /// that contain newlines. Masks still apply to the whole record, suffix included.
     pub fn first_line_only(mut self, v: bool) -> Self {
         self.opts.first_line_only = v;
         self

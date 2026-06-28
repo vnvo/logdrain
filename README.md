@@ -4,8 +4,7 @@
 
 **High-throughput, online log-template mining in Rust.**
 
-The Drain3 algorithm with path-preserving tokenization, masks, and stack-trace
-clustering - as an embeddable library and a CLI.
+The Drain3 algorithm with path-preserving tokenization, masks, and stack-trace clustering as an embeddable library and a CLI.
 
 [![CI](https://github.com/vnvo/logdrain/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/logdrain/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/logdrain.svg)](https://crates.io/crates/logdrain)
@@ -50,6 +49,9 @@ Cluster multi-line traces on their first line and keep the full trace as a per-c
 #### Extraction & members
 `extract()` recovers the variable values of a line; attach de-duplicated labels per cluster.
 
+#### Event-time aware
+Feed a parsed timestamp per line (`add_at`, or the CLI's `--time-key`) for true event-time first/last-seen and rates, independent of processing wall-clock.
+
 #### Exhaustive & persistent
 Exact per-template counts (no sampling, no top-N) with `snapshot`/`restore` to a pluggable backend.
 
@@ -62,7 +64,7 @@ Exact per-template counts (no sampling, no top-N) with `snapshot`/`restore` to a
 Collapse millions of lines into a handful of templates, ranked by volume, to see what's *actually* happening.
 
 #### New-pattern alerting
-Alert on the `Created` signal - the first time a never-seen log shape appears (new errors, attacks, regressions).
+Alert on the `Created` signal, the first time a never-seen log shape appears (new errors, attacks, regressions).
 
 #### Incident & exception clustering
 Rank distinct stack-trace failures by frequency, so you triage the top one instead of scrolling.
@@ -72,6 +74,10 @@ Store `(template, count)` instead of raw lines, or sample by template - a Vector
 
 #### Structured extraction
 Turn unstructured logs into `(template_id, params)` for dashboards, ML features, or alerting.
+
+#### Context for AI agents
+Compress millions of lines into a few hundred templates + counts so an LLM or incident-triage
+agent can reason over the whole picture - feed the catalog and the `Created` signal, not raw lines.
 
 #### Edge / agent summarization
 Embed it in a log shipper to summarize at the source and cut egress and ingest cost.
@@ -101,24 +107,152 @@ ID  SIZE  TEMPLATE
 ```sh
 cat app.log | logdrain --format json --sort size   # JSON, biggest clusters first
 cat events.ndjson | logdrain --key event.message    # pull a field out of JSON lines
+logdrain --format jsonl app.log | jq -c '{template, size}'   # stream one object/line into jq, Vector, Kafka, ...
 ```
+
+> **`createdAt` is observation time, not log time.** The `createdAt` / `updatedAt`
+> fields (and the derived `linesPerMinute` / `rate_per_min`) are the machine's
+> wall-clock when logdrain *first/last saw* each template - logdrain does **not** parse
+> timestamps from your records by default. Streaming a live feed they approximate event
+> time; replaying a historical file they reflect *when you ran the command* and how fast
+> you fed it, not the original event times or rate.
+>
+> For **true event time**, pass `--time-key <field>` (with optional `--time-format`).
+> logdrain then parses that timestamp out of each record and reports
+> `eventFirstSeen` / `eventLastSeen` / `eventRatePerMinute` - which reflect when events
+> actually happened, even when replaying historical logs:
+>
+> ```sh
+> logdrain --key msg --time-key ts app.ndjson --format jsonl   # epoch or RFC 3339, auto-detected
+> logdrain --key m --time-key t --time-format '%Y-%m-%d %H:%M:%S' app.ndjson
+> ```
+
+<details>
+<summary><b>Timestamp formats accepted by <code>--time-key</code></b></summary>
+
+**Auto-detected** (no `--time-format` needed) - covers most structured JSON logs:
+
+| Value | Example | |
+|---|---|---|
+| Unix epoch, seconds | `1700000000` | ✅ |
+| Unix epoch, milliseconds | `1700000000000` | ✅ |
+| Unix epoch, microseconds | `1700000000000000` | ✅ |
+| Unix epoch, nanoseconds | `1700000000000000000` | ✅ (unit auto-scaled by magnitude) |
+| RFC 3339 / ISO 8601, `Z` | `2024-01-01T12:30:00Z` | ✅ |
+| RFC 3339, fraction + offset | `2024-01-01T12:30:00.5+02:00` | ✅ |
+| Space-separated, no offset | `2024-01-01 12:30:00` | ❌ use `--time-format` |
+| Date only | `2024-01-01` | ❌ (no time-of-day) |
+
+**With `--time-format <FMT>`** - any [chrono strftime](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) pattern:
+
+| Format | Matches | |
+|---|---|---|
+| `%Y-%m-%d %H:%M:%S` | `2024-01-01 12:30:00` | ✅ (no offset → assumed **UTC**) |
+| `%d/%b/%Y:%H:%M:%S %z` | `02/Jan/2024:12:30:00 +0000` | ✅ (Apache / nginx access logs) |
+| `%s` | `1700000000` | ✅ (epoch via format) |
+| `%Y-%m-%d` | `2024-01-01` | ❌ (a value must have **both date and time**) |
+
+**Rules:**
+- A value must contain a full **date *and* time**; date-only values do not parse.
+- A pattern with an offset (`%z` / `%:z`) is honored; without one, the time is read as **UTC**.
+- The field value must be the **whole** timestamp - logdrain does not pull a timestamp out of the middle of a larger string. For JSON that's natural (`--time-key` points at a clean value).
+- Records whose timestamp is missing or unparseable are still clustered, just without event time; a count is printed to stderr.
+
+</details>
 
 <details>
 <summary><b>All CLI options</b></summary>
 
 | Option | Description |
 |---|---|
-| `--format text\|json\|csv` | output format (default `text`) |
+| `--format text\|json\|jsonl\|csv` | output format (default `text`); `jsonl` (alias `ndjson`) is one JSON object per line for piping into other tools |
 | `--key <FIELD>` | parse each line as JSON and extract this dot-path field |
 | `--masks <names>` | comma list of built-ins: `uuid,hex32,email,ipv4,jwt` |
 | `--path-delimiters <CHARS>` | characters preserved as token boundaries, e.g. `/` |
 | `--first-line-only` | cluster on the first line; keep the rest as a suffix |
+| `--record-separator <SEP>` | split records on a literal separator (e.g. `\n\n`, `\0`) instead of newlines |
+| `--multiline-start <REGEX>` | start a new record at each line matching REGEX; other lines continue it |
+| `--time-key <FIELD>` | JSON dot-path to a per-record event timestamp; enables true event-time rates |
+| `--time-format <FMT>` | chrono format for the `--time-key` value (else epoch / RFC 3339 auto-detected) |
 | `--sort size\|template\|id\|rate` | ordering (default `size`) |
 | `--min-size <N>` | hide clusters smaller than N |
 | `--sim-th <FLOAT>` | similarity threshold (default `0.4`) |
 | `--depth <N>` | prefix-tree depth (default `4`) |
 
 </details>
+
+### Input model
+
+By default the CLI treats **one line as one record**. That already covers the common
+cases:
+
+- **Plaintext** logs (one event per line).
+- **NDJSON** - one JSON object per line; use `--key <field>` to pull the message out.
+- **A stack trace escaped inside a JSON field** - since the whole event is still one
+  physical line, `--key stack --first-line-only` splits on the embedded `\n` and clusters
+  on the first line.
+
+When a single record spans **multiple physical lines** (raw console stack traces,
+pretty-printed JSON), pick one of two options - **which one depends on whether the stream
+already marks record boundaries:**
+
+**1. `--record-separator <SEP>` - when records are explicitly framed.**
+Use it when a known delimiter sits between records (or you control the producer and can
+emit one): a blank line, a NUL byte, a sentinel string. Exact and unambiguous. Escapes
+`\n \r \t \0 \\` are interpreted.
+
+```sh
+logdrain --record-separator '\n\n' app.log     # records separated by a blank line
+producer | logdrain --record-separator '\0'     # NUL-framed stream
+```
+
+**2. `--multiline-start <REGEX>` - when there is no delimiter.**
+Use it for ordinary logs you don't control, where a record *begins* with a recognizable
+line (a timestamp or level) and continuation lines (stack frames) follow. A line matching
+the regex starts a new record; every non-matching line is appended to it.
+
+```sh
+logdrain --multiline-start '^\d{4}-\d{2}-\d{2}' app.log   # records start at a timestamp
+logdrain --multiline-start '^(ERROR|WARN|INFO)' --first-line-only app.log
+```
+
+> **Rule of thumb:** if you can point at a character that separates records, use
+> `--record-separator`. If the boundary is only implied by what the *first line* looks
+> like (the usual case for tracebacks), use `--multiline-start`. The two are mutually
+> exclusive. Embedding the library? Skip both - *you* decide record boundaries and pass
+> each whole record (newlines and all) to `add()`.
+
+## 🧵 Stack traces
+
+**First-line mode** (`--first-line-only`, or `.first_line_only(true)`) changes *how much
+of a record is used to cluster*. Off (default), the whole record is tokenized; on, the
+record is split at the first newline and **only the first line** drives clustering and the
+template - the rest is kept as a per-cluster suffix (from the first occurrence). It only
+matters for records that span multiple lines.
+
+That's exactly what stack traces need: the frames differ every time, but the first line
+(exception type + message) is stable, so all occurrences collapse into one template (with
+masks applied, so per-request ids / IPs become placeholders) while one full trace is
+preserved as the suffix. The example below uses the **library** (each trace passed to
+`add()` as one record); from the CLI, assemble multi-line traces with `--multiline-start`
+or `--record-separator` (see [Input model](#input-model)):
+
+```console
+$ cargo run -p logdrain --example stacktrace
+6 traces  ->  3 distinct failures
+
+#1  x3  ERROR NullPointerException req <uuid> at com/acme/svc/OrderHandler.process
+        at OrderHandler.process(OrderHandler.java:142)
+        at Dispatcher.run(Dispatcher.java:88)
+        at java.base/Thread.run(Thread.java:829)
+
+#2  x2  ERROR SQLTimeoutException from <ipv4> at com/acme/db/ConnectionPool.acquire
+        at ConnectionPool.acquire(ConnectionPool.java:64)
+        at OrderHandler.load(OrderHandler.java:71)
+
+#3  x1  WARN RetryableException at com/acme/net/HttpClient.call
+        at HttpClient.call(HttpClient.java:33)
+```
 
 ## 📚 Library
 

@@ -1,4 +1,4 @@
-//! Rendering clusters as text, JSON, or CSV.
+//! Rendering clusters as text, JSON, JSON Lines (NDJSON), or CSV.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +10,12 @@ use logdrain::Cluster;
 pub enum Format {
     /// Aligned, human-readable columns.
     Text,
-    /// JSON array of cluster objects.
+    /// JSON array of cluster objects (pretty-printed).
     Json,
+    /// JSON Lines: one compact JSON object per line, for streaming into other
+    /// systems (jq, Vector, Logstash, Kafka, Elasticsearch, ...).
+    #[value(alias = "ndjson")]
+    Jsonl,
     /// RFC-4180 CSV with a header row.
     Csv,
 }
@@ -57,6 +61,7 @@ pub fn render(clusters: &[Cluster], format: Format) -> String {
     match format {
         Format::Text => render_text(clusters),
         Format::Json => render_json(clusters),
+        Format::Jsonl => render_jsonl(clusters),
         Format::Csv => render_csv(clusters),
     }
 }
@@ -106,23 +111,39 @@ fn render_text(clusters: &[Cluster]) -> String {
     out
 }
 
+/// One cluster as a JSON object. Shared by the `json` and `jsonl` renderers so the
+/// two formats never drift apart.
+fn cluster_json(c: &Cluster) -> serde_json::Value {
+    serde_json::json!({
+        "id": c.id(),
+        "size": c.size(),
+        "template": c.template(),
+        "linesPerMinute": c.lines_per_minute(),
+        "createdAt": unix_ms(c.created_at()),
+        "updatedAt": unix_ms(c.updated_at()),
+        // Event-time fields are null unless --time-key supplied timestamps.
+        "eventFirstSeen": c.event_first_seen().map(unix_ms),
+        "eventLastSeen": c.event_last_seen().map(unix_ms),
+        "eventRatePerMinute": c.event_lines_per_minute(),
+        "members": c.members().iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+        "suffix": c.suffix(),
+    })
+}
+
 fn render_json(clusters: &[Cluster]) -> String {
-    let arr: Vec<serde_json::Value> = clusters
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "id": c.id(),
-                "size": c.size(),
-                "template": c.template(),
-                "linesPerMinute": c.lines_per_minute(),
-                "createdAt": unix_ms(c.created_at()),
-                "updatedAt": unix_ms(c.updated_at()),
-                "members": c.members().iter().map(|m| m.to_string()).collect::<Vec<_>>(),
-                "suffix": c.suffix(),
-            })
-        })
-        .collect();
+    let arr: Vec<serde_json::Value> = clusters.iter().map(cluster_json).collect();
     serde_json::to_string_pretty(&arr).expect("cluster json is always serializable")
+}
+
+fn render_jsonl(clusters: &[Cluster]) -> String {
+    let mut out = String::new();
+    for c in clusters {
+        let obj =
+            serde_json::to_string(&cluster_json(c)).expect("cluster json is always serializable");
+        out.push_str(&obj);
+        out.push('\n');
+    }
+    out
 }
 
 fn csv_escape(field: &str) -> String {
@@ -134,9 +155,12 @@ fn csv_escape(field: &str) -> String {
 }
 
 fn render_csv(clusters: &[Cluster]) -> String {
-    let mut out =
-        String::from("id,size,rate_per_min,template,created_at,updated_at,members,suffix\n");
+    let mut out = String::from(
+        "id,size,rate_per_min,template,created_at,updated_at,\
+         event_first_seen,event_last_seen,event_rate_per_min,members,suffix\n",
+    );
     for c in clusters {
+        let opt_ms = |t: Option<std::time::SystemTime>| t.map(unix_ms).map(|n| n.to_string());
         let row = [
             c.id().to_string(),
             c.size().to_string(),
@@ -144,6 +168,11 @@ fn render_csv(clusters: &[Cluster]) -> String {
             c.template().to_string(),
             unix_ms(c.created_at()).to_string(),
             unix_ms(c.updated_at()).to_string(),
+            opt_ms(c.event_first_seen()).unwrap_or_default(),
+            opt_ms(c.event_last_seen()).unwrap_or_default(),
+            c.event_lines_per_minute()
+                .map(|r| format!("{r:.1}"))
+                .unwrap_or_default(),
             c.members()
                 .iter()
                 .map(|m| m.to_string())
@@ -210,14 +239,51 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_is_one_object_per_line() {
+        let cs = prepare(sample(), 0, Sort::Size);
+        let out = render(&cs, Format::Jsonl);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), cs.len()); // one line per cluster, no array wrapper
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v.is_object());
+            assert!(!line.contains('\n'));
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[0]).unwrap()["template"],
+            "user <*> logged in"
+        );
+    }
+
+    #[test]
     fn csv_has_header_and_rows() {
         let out = render(&prepare(sample(), 0, Sort::Size), Format::Csv);
         let mut lines = out.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "id,size,rate_per_min,template,created_at,updated_at,members,suffix"
+            "id,size,rate_per_min,template,created_at,updated_at,\
+             event_first_seen,event_last_seen,event_rate_per_min,members,suffix"
         );
         assert!(lines.next().unwrap().contains("user <*> logged in"));
+    }
+
+    #[test]
+    fn event_fields_are_null_without_event_time_and_set_with_it() {
+        // No event time -> JSON event fields are null.
+        let plain = render(&prepare(sample(), 0, Sort::Size), Format::Jsonl);
+        let first: serde_json::Value = serde_json::from_str(plain.lines().next().unwrap()).unwrap();
+        assert!(first["eventFirstSeen"].is_null());
+        assert!(first["eventRatePerMinute"].is_null());
+
+        // With event time -> populated.
+        let m = Miner::builder().build().unwrap();
+        m.add_at("user 1 in", 60_000);
+        m.add_at("user 2 in", 180_000); // span 120s
+        let out = render(&prepare(m.clusters(), 0, Sort::Size), Format::Jsonl);
+        let v: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(v["eventFirstSeen"], 60_000);
+        assert_eq!(v["eventLastSeen"], 180_000);
+        assert_eq!(v["eventRatePerMinute"], 1.0); // 2 lines / 2 min
     }
 
     #[test]

@@ -40,20 +40,38 @@ pub(crate) struct ClusterInner {
     pub(crate) created_at: SystemTime,
     pub(crate) updated_at_ms: AtomicU64,
     pub(crate) last_used: AtomicU64,
-    /// Verbatim remainder after the first line (set at creation in first-line mode).
+    /// Smallest event timestamp (unix-ms) seen for this cluster, or [`EVENT_UNSET`]
+    /// if no event time has been supplied (via `add_at`). Event time is what the
+    /// caller parses out of the log; it is independent of `created_at`/`updated_at`.
+    pub(crate) event_first_ms: AtomicU64,
+    /// Largest event timestamp (unix-ms) seen, or `0` when unset.
+    pub(crate) event_last_ms: AtomicU64,
+    /// Remainder after the first line (set at creation in first-line mode); it goes
+    /// through the same mask pass as the rest of the input, so it is not raw text.
     pub(crate) suffix: Option<Arc<str>>,
     /// Deduplicated member labels recorded via `add_with_member`.
     pub(crate) members: Vec<Arc<str>>,
 }
 
+/// Sentinel for `event_first_ms` meaning "no event timestamp recorded". Using
+/// `u64::MAX` lets [`ClusterInner::observe_event`] use a plain atomic `fetch_min`.
+pub(crate) const EVENT_UNSET: u64 = u64::MAX;
+
 impl ClusterInner {
-    /// Create a fresh cluster of size 1 from the given owned tokens and optional suffix.
+    /// Create a fresh cluster of size 1 from the given owned tokens and optional
+    /// suffix. `event_ms` is the caller-supplied event timestamp (unix-ms) for this
+    /// first line, or `None` if event time is not being tracked.
     pub(crate) fn new(
         id: ClusterId,
         tokens: Vec<OwnedToken>,
         now: SystemTime,
         suffix: Option<Arc<str>>,
+        event_ms: Option<u64>,
     ) -> Self {
+        let (event_first, event_last) = match event_ms {
+            Some(ms) => (ms, ms),
+            None => (EVENT_UNSET, 0),
+        };
         ClusterInner {
             id,
             tokens,
@@ -61,6 +79,8 @@ impl ClusterInner {
             created_at: now,
             updated_at_ms: AtomicU64::new(unix_ms(now)),
             last_used: AtomicU64::new(0),
+            event_first_ms: AtomicU64::new(event_first),
+            event_last_ms: AtomicU64::new(event_last),
             suffix,
             members: Vec::new(),
         }
@@ -73,6 +93,13 @@ impl ClusterInner {
         self.size.fetch_add(1, Ordering::Relaxed);
         self.updated_at_ms.store(now_ms(), Ordering::Relaxed);
         self.last_used.store(tick, Ordering::Relaxed);
+    }
+
+    /// Fold an event timestamp (unix-ms) into this cluster's min/max event window.
+    /// Atomic, so it runs under the shared (read) lock like [`touch`](Self::touch).
+    pub(crate) fn observe_event(&self, ms: u64) {
+        self.event_first_ms.fetch_min(ms, Ordering::Relaxed);
+        self.event_last_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
     /// LRU recency key (monotonic tick; higher = more recently used).
@@ -148,6 +175,15 @@ impl ClusterInner {
 
     /// Produce an immutable public snapshot.
     pub(crate) fn to_public(&self, wildcard: &str) -> Cluster {
+        let ef = self.event_first_ms.load(Ordering::Relaxed);
+        let (event_first, event_last) = if ef == EVENT_UNSET {
+            (None, None)
+        } else {
+            (
+                Some(time_from_ms(ef)),
+                Some(time_from_ms(self.event_last_ms.load(Ordering::Relaxed))),
+            )
+        };
         Cluster {
             id: self.id,
             template: self.render_template(wildcard),
@@ -155,6 +191,8 @@ impl ClusterInner {
             size: self.size.load(Ordering::Relaxed),
             created_at: self.created_at,
             updated_at: time_from_ms(self.updated_at_ms.load(Ordering::Relaxed)),
+            event_first,
+            event_last,
             suffix: self.suffix.clone(),
             members: self.members.clone(),
         }
@@ -170,6 +208,8 @@ pub struct Cluster {
     size: u64,
     created_at: SystemTime,
     updated_at: SystemTime,
+    event_first: Option<SystemTime>,
+    event_last: Option<SystemTime>,
     suffix: Option<Arc<str>>,
     members: Vec<Arc<str>>,
 }
@@ -191,7 +231,8 @@ impl Cluster {
     pub fn tokens(&self) -> &[OwnedToken] {
         &self.tokens
     }
-    /// Verbatim suffix captured in first-line-only mode, if any.
+    /// Suffix captured in first-line-only mode, if any (masked like the rest of the
+    /// input, not raw text). See [`crate::MinerBuilder::first_line_only`].
     pub fn suffix(&self) -> Option<&str> {
         self.suffix.as_deref()
     }
@@ -199,17 +240,30 @@ impl Cluster {
     pub fn members(&self) -> &[Arc<str>] {
         &self.members
     }
-    /// When the cluster was first created.
+    /// Wall-clock time this cluster was first observed **during processing**.
+    ///
+    /// This is the machine's clock at the moment `add` first created the cluster -
+    /// it is **not** parsed from the log line. logdrain never reads timestamps out
+    /// of your records. Streaming a live feed, this approximates event time; replaying
+    /// a historical file, it is the time you ran the program, not when the events
+    /// happened.
     pub fn created_at(&self) -> SystemTime {
         self.created_at
     }
-    /// When the cluster was last updated.
+    /// Wall-clock time this cluster was last hit **during processing** (same caveat
+    /// as [`created_at`](Self::created_at): observation time, not log time).
     pub fn updated_at(&self) -> SystemTime {
         self.updated_at
     }
-    /// Approximate lines-per-minute over the cluster's lifetime. Returns `0.0`
-    /// when the span is under one second (rate is unknown over a sub-second
-    /// window — e.g. a one-shot batch where all lines arrive at once).
+    /// Approximate lines-per-minute over the cluster's **observed** lifetime
+    /// (`updated_at - created_at`). Returns `0.0` when the span is under one second
+    /// (rate is unknown over a sub-second window - e.g. a one-shot batch where all
+    /// lines arrive at once).
+    ///
+    /// Because the span is measured from processing wall-clock (see
+    /// [`created_at`](Self::created_at)), this is the rate logdrain *saw* lines, which
+    /// only equals the real event rate when you stream a live feed. Replaying a file
+    /// measures how fast you fed it, not the original traffic.
     pub fn lines_per_minute(&self) -> f64 {
         let secs = self
             .updated_at
@@ -222,6 +276,42 @@ impl Cluster {
             self.size as f64 / (secs / 60.0)
         }
     }
+
+    /// Earliest **event** timestamp recorded for this cluster, or `None` if event
+    /// time was never supplied (i.e. lines were added with `add`, not `add_at`).
+    ///
+    /// Unlike [`created_at`](Self::created_at), this is the timestamp *you parsed
+    /// from the log* and passed in - so it reflects when the event actually
+    /// happened, even when replaying a historical file.
+    pub fn event_first_seen(&self) -> Option<SystemTime> {
+        self.event_first
+    }
+
+    /// Latest **event** timestamp recorded, or `None` if event time was never
+    /// supplied. See [`event_first_seen`](Self::event_first_seen).
+    pub fn event_last_seen(&self) -> Option<SystemTime> {
+        self.event_last
+    }
+
+    /// True lines-per-minute computed from the **event** time window
+    /// (`event_last_seen - event_first_seen`), or `None` if event time was never
+    /// supplied. Returns `Some(0.0)` when the window is under one second (e.g. a
+    /// single event, or many sharing one timestamp).
+    ///
+    /// This is the event-rate analogue of [`lines_per_minute`](Self::lines_per_minute):
+    /// it measures real traffic, not how fast logdrain processed the input.
+    pub fn event_lines_per_minute(&self) -> Option<f64> {
+        let (first, last) = (self.event_first?, self.event_last?);
+        let secs = last
+            .duration_since(first)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        Some(if secs < 1.0 {
+            0.0
+        } else {
+            self.size as f64 / (secs / 60.0)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -232,7 +322,7 @@ mod tests {
 
     fn inner_from(line: &str, id: u64) -> ClusterInner {
         let toks: Vec<_> = tokenize(line).iter().map(crate::OwnedToken::from).collect();
-        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None)
+        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None, None)
     }
 
     #[test]
@@ -281,7 +371,7 @@ mod tests {
             .iter()
             .map(crate::OwnedToken::from)
             .collect();
-        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None)
+        ClusterInner::new(id, toks, SystemTime::UNIX_EPOCH, None, None)
     }
 
     #[test]
@@ -295,8 +385,34 @@ mod tests {
             toks,
             SystemTime::UNIX_EPOCH,
             Some(Arc::from("at line 1\nat line 2")),
+            None,
         );
         assert_eq!(c.to_public("<*>").suffix(), Some("at line 1\nat line 2"));
+    }
+
+    #[test]
+    fn event_time_unset_by_default() {
+        let snap = inner_from("a b", 1).to_public("<*>");
+        assert!(snap.event_first_seen().is_none());
+        assert!(snap.event_last_seen().is_none());
+        assert!(snap.event_lines_per_minute().is_none());
+    }
+
+    #[test]
+    fn observe_event_tracks_min_max_and_rate() {
+        let toks: Vec<_> = tokenize("a b")
+            .iter()
+            .map(crate::OwnedToken::from)
+            .collect();
+        // Created at event t=60_000 ms; later observe earlier and later events.
+        let c = ClusterInner::new(1, toks, SystemTime::UNIX_EPOCH, None, Some(60_000));
+        c.observe_event(0); // earlier -> new min
+        c.observe_event(180_000); // later -> new max (span 180s = 3 min)
+        c.size.store(6, Ordering::Relaxed);
+        let snap = c.to_public("<*>");
+        assert_eq!(snap.event_first_seen(), Some(time_from_ms(0)));
+        assert_eq!(snap.event_last_seen(), Some(time_from_ms(180_000)));
+        assert_eq!(snap.event_lines_per_minute(), Some(2.0)); // 6 lines / 3 min
     }
 
     #[test]
