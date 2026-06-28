@@ -1,7 +1,7 @@
 [package]
 name = "logdrain"
 version = "0.2.0"
-description = "Online Drain3 log-template mining with path-preserving tokenization"
+description = "Online Drain log-template mining with path-preserving tokenization, masks, and persistence"
 readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,17 @@ smallvec.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
+
+# Optional persistence backends, off by default to keep the core dependency-light.
+redis = { version = "0.27", optional = true, default-features = false }
+rdkafka = { version = "0.36", optional = true, features = ["cmake-build"] }
+
+[features]
+# Redis snapshot backend (`RedisPersistence`). Pure-Rust, no system deps.
+redis = ["dep:redis"]
+# Kafka snapshot backend (`KafkaPersistence`) via a compacted topic. Pulls
+# rdkafka, which vendors and builds librdkafka (needs a C toolchain + cmake).
+kafka = ["dep:rdkafka"]
 
 [dev-dependencies]
 proptest = "1"

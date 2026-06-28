@@ -37,11 +37,20 @@ jobs:
             exit 1
           fi
 
+      - name: Install librdkafka build deps (for the kafka feature)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libssl-dev libsasl2-dev libzstd-dev zlib1g-dev libcurl4-openssl-dev
+
       - name: Verify before publishing
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
+          # Optional backends must also compile before we publish.
+          cargo clippy -p logdrain --features redis,kafka --all-targets -- -D warnings
+          cargo test -p logdrain --features redis,kafka
 
       # The library must be published before the CLI, which depends on it.
       # `cargo publish` waits for the new version to be indexed before returning.

@@ -1,7 +1,8 @@
-//! Pluggable persistence: a small synchronous trait plus in-tree Memory and File
-//! backends. The miner serializes via [`crate::Miner::snapshot`] and hands the
-//! bytes to a backend; the interface is intentionally minimal so other backends
-//! (Redis, S3) can live in separate crates.
+//! Pluggable persistence: a small synchronous trait plus in-tree backends. The
+//! miner serializes via [`crate::Miner::snapshot`] and hands the bytes to a backend.
+//! `MemoryPersistence` and `FilePersistence` are always available; `RedisPersistence`
+//! and `KafkaPersistence` are behind the `redis` and `kafka` cargo features so the
+//! core stays dependency-light.
 
 use std::fs;
 use std::io::Write;
@@ -14,6 +15,9 @@ pub enum PersistenceError {
     /// Underlying I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Failure reported by an external backend (Redis, Kafka, ...).
+    #[error("backend: {0}")]
+    Backend(String),
 }
 
 /// A place to store and retrieve a serialized miner snapshot.
@@ -93,6 +97,150 @@ impl Persistence for FilePersistence {
     }
 }
 
+/// Redis snapshot backend (cargo feature `redis`): stores the latest snapshot blob
+/// under a single key. Pure-Rust client, no system dependencies.
+#[cfg(feature = "redis")]
+mod redis_backend {
+    use super::{Persistence, PersistenceError};
+    use redis::Commands;
+
+    fn err(e: redis::RedisError) -> PersistenceError {
+        PersistenceError::Backend(e.to_string())
+    }
+
+    /// Stores the snapshot at a single Redis key (overwritten on each `save`).
+    pub struct RedisPersistence {
+        client: redis::Client,
+        key: String,
+    }
+
+    impl RedisPersistence {
+        /// Connect to `url` (e.g. `redis://127.0.0.1/`) and store the snapshot at `key`.
+        /// The connection is opened lazily per operation, so this only validates the URL.
+        pub fn new(url: &str, key: impl Into<String>) -> Result<Self, PersistenceError> {
+            let client = redis::Client::open(url).map_err(err)?;
+            Ok(Self {
+                client,
+                key: key.into(),
+            })
+        }
+    }
+
+    impl Persistence for RedisPersistence {
+        fn save(&self, blob: &[u8]) -> Result<(), PersistenceError> {
+            let mut conn = self.client.get_connection().map_err(err)?;
+            conn.set::<_, _, ()>(self.key.as_str(), blob).map_err(err)?;
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Option<Vec<u8>>, PersistenceError> {
+            let mut conn = self.client.get_connection().map_err(err)?;
+            let blob: Option<Vec<u8>> = conn.get(self.key.as_str()).map_err(err)?;
+            Ok(blob)
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+pub use redis_backend::RedisPersistence;
+
+/// Kafka snapshot backend (cargo feature `kafka`): writes the snapshot as the latest
+/// record on a topic and reads it back from the tail of partition 0. Use a
+/// single-partition, log-compacted topic so the latest snapshot is retained.
+///
+/// Built on `rdkafka` (which links librdkafka); enabling this feature requires a C
+/// toolchain. Uses the synchronous `BaseProducer` / `BaseConsumer`, so it fits the
+/// blocking [`Persistence`] trait without an async runtime.
+#[cfg(feature = "kafka")]
+mod kafka_backend {
+    use std::time::Duration;
+
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    use rdkafka::{Message, Offset, TopicPartitionList};
+
+    use super::{Persistence, PersistenceError};
+
+    /// Fixed record key the snapshot is written under (so log compaction keeps one).
+    const SNAPSHOT_KEY: &str = "logdrain-snapshot";
+
+    fn err<E: std::fmt::Display>(e: E) -> PersistenceError {
+        PersistenceError::Backend(e.to_string())
+    }
+
+    /// Stores the snapshot as the tail record of a (recommended: compacted,
+    /// single-partition) Kafka topic.
+    pub struct KafkaPersistence {
+        brokers: String,
+        topic: String,
+        timeout: Duration,
+    }
+
+    impl KafkaPersistence {
+        /// `brokers` is a comma-separated `host:port` list; `topic` should be a
+        /// single-partition, `cleanup.policy=compact` topic.
+        pub fn new(brokers: impl Into<String>, topic: impl Into<String>) -> Self {
+            Self {
+                brokers: brokers.into(),
+                topic: topic.into(),
+                timeout: Duration::from_secs(10),
+            }
+        }
+
+        /// Override the per-operation timeout (default 10s).
+        pub fn with_timeout(mut self, timeout: Duration) -> Self {
+            self.timeout = timeout;
+            self
+        }
+    }
+
+    impl Persistence for KafkaPersistence {
+        fn save(&self, blob: &[u8]) -> Result<(), PersistenceError> {
+            let producer: BaseProducer = ClientConfig::new()
+                .set("bootstrap.servers", self.brokers.as_str())
+                .create()
+                .map_err(err)?;
+            producer
+                .send(
+                    BaseRecord::to(self.topic.as_str())
+                        .key(SNAPSHOT_KEY)
+                        .payload(blob),
+                )
+                .map_err(|(e, _)| err(e))?;
+            producer.flush(self.timeout).map_err(err)?;
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Option<Vec<u8>>, PersistenceError> {
+            let consumer: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", self.brokers.as_str())
+                .set("group.id", "logdrain-loader")
+                .set("enable.auto.commit", "false")
+                .create()
+                .map_err(err)?;
+            let (low, high) = consumer
+                .fetch_watermarks(self.topic.as_str(), 0, self.timeout)
+                .map_err(err)?;
+            if high <= low {
+                return Ok(None); // nothing stored yet
+            }
+            let mut tpl = TopicPartitionList::new();
+            tpl.add_partition_offset(self.topic.as_str(), 0, Offset::Offset(high - 1))
+                .map_err(err)?;
+            consumer.assign(&tpl).map_err(err)?;
+            match consumer.poll(self.timeout) {
+                Some(Ok(msg)) => Ok(msg.payload().map(<[u8]>::to_vec)),
+                Some(Err(e)) => Err(err(e)),
+                None => Ok(None), // timed out with nothing read
+            }
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
+pub use kafka_backend::KafkaPersistence;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +290,34 @@ mod tests {
     fn load_state_from_empty_backend_is_false() {
         let m = crate::Miner::builder().build().unwrap();
         assert!(!m.load_state(&MemoryPersistence::new()).unwrap());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_new_validates_url() {
+        assert!(RedisPersistence::new("redis://127.0.0.1/", "logdrain:snap").is_ok());
+        assert!(RedisPersistence::new("not-a-redis-url", "k").is_err());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    #[ignore = "requires a running Redis (set REDIS_URL, default redis://127.0.0.1/)"]
+    fn redis_round_trip() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+        let p = RedisPersistence::new(&url, "logdrain:test:snap").unwrap();
+        p.save(b"snap-bytes").unwrap();
+        assert_eq!(p.load().unwrap(), Some(b"snap-bytes".to_vec()));
+        p.save(b"newer").unwrap();
+        assert_eq!(p.load().unwrap(), Some(b"newer".to_vec()));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    #[ignore = "requires a running Kafka (set KAFKA_BROKERS, default localhost:9092)"]
+    fn kafka_round_trip() {
+        let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+        let p = KafkaPersistence::new(brokers, "logdrain-test-snap");
+        p.save(b"snap-bytes").unwrap();
+        assert_eq!(p.load().unwrap(), Some(b"snap-bytes".to_vec()));
     }
 }

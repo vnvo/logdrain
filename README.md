@@ -4,7 +4,7 @@
 
 **High-throughput, online log-template mining in Rust.**
 
-The Drain3 algorithm with path-preserving tokenization, masks, and stack-trace clustering as an embeddable library and a CLI.
+An independent Rust implementation of the **Drain** log-mining algorithm (He et al., 2017) - with the practical extensions Drain3 popularized (masks, persistence, numeric parametrization) plus path-preserving tokenization and stack-trace clustering - as an embeddable library and a CLI.
 
 [![CI](https://github.com/vnvo/logdrain/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/logdrain/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/logdrain.svg)](https://crates.io/crates/logdrain)
@@ -291,8 +291,29 @@ let restored = Miner::builder().build().unwrap();
 restored.load_state(&store).unwrap();     // rebuilds the tree from the snapshot
 ```
 
-`Persistence` is a small sync trait; `MemoryPersistence` and `FilePersistence` ship in
-core, and `Miner::{snapshot, restore}` expose the raw bytes for any other backend.
+`Persistence` is a small sync trait. `MemoryPersistence` and `FilePersistence` ship in
+core; `RedisPersistence` and `KafkaPersistence` are behind cargo features so the core
+stays dependency-light, and `Miner::{snapshot, restore}` expose the raw bytes for any
+other backend.
+
+```toml
+logdrain = { version = "0.3", features = ["redis"] }  # or "kafka", or both
+```
+
+```rust
+// Redis: latest snapshot stored under one key.
+let store = logdrain::RedisPersistence::new("redis://127.0.0.1/", "logdrain:snapshot")?;
+
+// Kafka: snapshot written to the tail of a (compacted, single-partition) topic.
+let store = logdrain::KafkaPersistence::new("localhost:9092", "logdrain-snapshots");
+
+miner.save_state(&store)?;
+miner.load_state(&store)?;
+```
+
+The `kafka` feature builds `rdkafka`, which links **librdkafka** - enabling it needs a C
+toolchain (and the usual `libssl`/`libsasl2`/`libcurl` dev headers). The `redis` feature
+is pure Rust with no system dependencies.
 
 </details>
 
@@ -313,8 +334,9 @@ Reproduce: `cargo bench -p logdrain --bench add`, or
 
 ## 🗺️  Status & roadmap
 
-**Available:** `logdrain` (library) and `logdrain-cli`, published and tested.
-**Roadmap:** an HTTP service (`draind`), Redis/S3 persistence backends, and
+**Available:** `logdrain` (library) and `logdrain-cli`, published and tested, with
+Redis and Kafka persistence backends behind cargo features.
+**Roadmap:** an HTTP service (`draind`), an S3 persistence backend, and
 hierarchical/distributed aggregation.
 
 ## 🤝 Contributing
