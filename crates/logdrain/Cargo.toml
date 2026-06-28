@@ -1,6 +1,6 @@
 [package]
 name = "logdrain"
-version = "0.2.0"
+version = "0.3.0"
 description = "Online Drain log-template mining with path-preserving tokenization, masks, and persistence"
 readme = "README.md"
 edition.workspace = true

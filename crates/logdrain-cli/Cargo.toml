@@ -1,6 +1,6 @@
 [package]
 name = "logdrain-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Command-line log-template miner (ships the `logdrain` binary)"
 readme = "README.md"
 edition.workspace = true
@@ -15,7 +15,7 @@ path = "src/main.rs"
 doc = false  # avoid rustdoc output collision with the `logdrain` library crate
 
 [dependencies]
-logdrain = { path = "../logdrain", version = "0.2" }
+logdrain = { path = "../logdrain", version = "0.3" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 regex = "1"

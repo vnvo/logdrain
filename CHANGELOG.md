@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-28
+
+### Added
+
+- **Redis persistence backend** (`RedisPersistence`, cargo feature `redis`): stores the
+  latest snapshot under a single key. Pure-Rust client, no system dependencies.
+- **Kafka persistence backend** (`KafkaPersistence`, cargo feature `kafka`): writes the
+  snapshot to the tail of a topic and reads it back from partition 0 — use a compacted,
+  single-partition topic for snapshot semantics. Built on `rdkafka`; enabling the feature
+  requires a C toolchain and links librdkafka.
+
+### Changed
+
+- Wording: logdrain is described as an independent Rust implementation of the **Drain**
+  algorithm (He et al., 2017) with the practical extensions Drain3 popularized, rather
+  than "the Drain3 algorithm".
+
+### Notes
+
+- Both backends are **off by default** — the core crate stays dependency-light.
+
 ## [0.2.0] - 2026-06-28
 
 ### Added
@@ -61,6 +82,7 @@ All notable changes to this project are documented here. The format is based on
   clustering, exact per-template counts, snapshot/restore persistence, and a thread-safe
   sharded hot path.
 
+[0.3.0]: https://github.com/vnvo/logdrain/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vnvo/logdrain/releases/tag/v0.2.0
 [0.1.1]: https://github.com/vnvo/logdrain/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vnvo/logdrain/releases/tag/v0.1.0
